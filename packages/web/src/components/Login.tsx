@@ -2,13 +2,12 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { createClient } from 'matrix-js-sdk'
 
 const HS_STORAGE_KEY = 'vanish.homeserver'
+const SSO_USED_PREFIX = 'vanish.sso.used:' // per-token guard
 
 function normalizeHs(input: string): string {
   const s = (input || '').trim()
   if (!s) return ''
-  // Add scheme if user typed just the host
-  if (!/^https?:\/\//i.test(s)) return `https://${s}`
-  return s
+  return /^https?:\/\//i.test(s) ? s : `https://${s}`
 }
 
 function isValidUrl(u: string): boolean {
@@ -33,39 +32,48 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
     if (normalizedHs) localStorage.setItem(HS_STORAGE_KEY, normalizedHs)
   }, [normalizedHs])
 
-  // Finish SSO if we returned with a loginToken
+  // 🔹 Finish SSO if we returned with a loginToken
   useEffect(() => {
     const url = new URL(window.location.href)
     const hashParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : '')
     const token = hashParams.get('loginToken') || url.searchParams.get('loginToken')
     if (!token) return
 
-    const hs = normalizeHs(localStorage.getItem(HS_STORAGE_KEY) || homeserver)
+    // Guard: prevent double-use of the same token (React StrictMode runs effects twice)
+    const guardKey = `${SSO_USED_PREFIX}${token}`
+    if (sessionStorage.getItem(guardKey)) return
+    sessionStorage.setItem(guardKey, '1')
+
+    const hsStored = localStorage.getItem(HS_STORAGE_KEY) || ''
+    const hs = normalizeHs(hsStored || homeserver)
 
     if (!isValidUrl(hs)) {
       setError(`Invalid homeserver URL: "${hs || '(empty)'}"`)
       return
     }
 
-    (async () => {
+    ;(async () => {
       try {
         setLoading(true)
         const client = createClient({ baseUrl: hs })
-        await client.loginWithToken(token)
+        await client.loginWithToken(token) // POST /_matrix/client/v3/login
         await client.startClient()
 
         // Clean token from the URL
         history.replaceState(null, '', url.origin + url.pathname)
         onLoggedIn()
       } catch (e: any) {
+        // Clear guard so user can retry if it fails
+        sessionStorage.removeItem(guardKey)
         setError(e?.message ?? String(e))
       } finally {
         setLoading(false)
       }
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // run once on mount
+  }, [])
 
+  // 🔹 Password login handler
   async function doLogin(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
@@ -78,7 +86,6 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
 
     try {
       setLoading(true)
-      // If you have your own hook, call it here. For demo, do raw password login:
       const client = createClient({ baseUrl: hs })
       await client.login('m.login.password', { user, password: pass })
       await client.startClient()
@@ -90,6 +97,7 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
     }
   }
 
+  // 🔹 Handle SSO button click
   function handleSSO() {
     setError(null)
 
@@ -100,7 +108,7 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
     }
 
     try {
-      localStorage.setItem(HS_STORAGE_KEY, hs) // ensure it survives the redirect
+      localStorage.setItem(HS_STORAGE_KEY, hs) // keep it across redirects
       const client = createClient({ baseUrl: hs })
       const redirect = window.location.href
       const url = client.getSsoLoginUrl(redirect)
