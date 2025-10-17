@@ -1,0 +1,13 @@
+:root { color-scheme: light dark; font-family: Inter, system-ui, sans-serif; }
+body { margin: 0; }
+.app { display: grid; grid-template-columns: 280px 1fr; height: 100dvh; }
+.sidebar { border-right: 1px solid #ddd; padding: 12px; overflow: auto; }
+.main { display: flex; flex-direction: column; height: 100%; }
+.header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #ddd; }
+.messages { flex: 1; overflow: auto; padding: 12px; }
+.input { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #ddd; }
+.badge { font-size: 12px; opacity: .8; }
+.btn { cursor: pointer; padding: 6px 10px; border: 1px solid #aaa; border-radius: 6px; background: transparent; }
+input { padding: 8px; border: 1px solid #999; border-radius: 6px; background: transparent; color: inherit; }
+label { display:block; margin-top: 8px; font-size: 14px; }
+h1, h3 { margin: 8px 0; }
