@@ -1,31 +1,59 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { createClient } from 'matrix-js-sdk'
-import { useMatrix } from '../matrix/client'
+
+const HS_STORAGE_KEY = 'vanish.homeserver'
+
+function normalizeHs(input: string): string {
+  const s = (input || '').trim()
+  if (!s) return ''
+  // Add scheme if user typed just the host
+  if (!/^https?:\/\//i.test(s)) return `https://${s}`
+  return s
+}
+
+function isValidUrl(u: string): boolean {
+  try { new URL(u); return true } catch { return false }
+}
 
 export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
-  const { initPasswordLogin } = useMatrix()
+  const envDefault = import.meta.env.VITE_MATRIX_HOMESERVER_URL || ''
+  const stored = (typeof window !== 'undefined' && localStorage.getItem(HS_STORAGE_KEY)) || ''
+  const initial = normalizeHs(stored || envDefault)
 
-  const [homeserver, setHomeserver] = useState(
-    import.meta.env.VITE_MATRIX_HOMESERVER_URL || ''
-  )
+  const [homeserver, setHomeserver] = useState(initial)
   const [user, setUser] = useState('')
   const [pass, setPass] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Finish SSO if we returned with a loginToken (in hash or query)
+  const normalizedHs = useMemo(() => normalizeHs(homeserver), [homeserver])
+
+  // Persist HS as the user types (so it's available after SSO round-trip)
+  useEffect(() => {
+    if (normalizedHs) localStorage.setItem(HS_STORAGE_KEY, normalizedHs)
+  }, [normalizedHs])
+
+  // Finish SSO if we returned with a loginToken
   useEffect(() => {
     const url = new URL(window.location.href)
     const hashParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : '')
     const token = hashParams.get('loginToken') || url.searchParams.get('loginToken')
     if (!token) return
 
+    const hs = normalizeHs(localStorage.getItem(HS_STORAGE_KEY) || homeserver)
+
+    if (!isValidUrl(hs)) {
+      setError(`Invalid homeserver URL: "${hs || '(empty)'}"`)
+      return
+    }
+
     (async () => {
       try {
         setLoading(true)
-        const client = createClient({ baseUrl: homeserver })
+        const client = createClient({ baseUrl: hs })
         await client.loginWithToken(token)
         await client.startClient()
+
         // Clean token from the URL
         history.replaceState(null, '', url.origin + url.pathname)
         onLoggedIn()
@@ -36,14 +64,24 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
       }
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [homeserver])
+  }, []) // run once on mount
 
   async function doLogin(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
-    setLoading(true)
+
+    const hs = normalizedHs
+    if (!isValidUrl(hs)) {
+      setError('Please enter a valid homeserver URL (e.g., https://synapse.example.com)')
+      return
+    }
+
     try {
-      await initPasswordLogin({ homeserver, user, pass })
+      setLoading(true)
+      // If you have your own hook, call it here. For demo, do raw password login:
+      const client = createClient({ baseUrl: hs })
+      await client.login('m.login.password', { user, password: pass })
+      await client.startClient()
       onLoggedIn()
     } catch (e: any) {
       setError(e?.message ?? String(e))
@@ -53,9 +91,17 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
   }
 
   function handleSSO() {
+    setError(null)
+
+    const hs = normalizedHs
+    if (!isValidUrl(hs)) {
+      setError('Please enter a valid homeserver URL before using SSO.')
+      return
+    }
+
     try {
-      setError(null)
-      const client = createClient({ baseUrl: homeserver })
+      localStorage.setItem(HS_STORAGE_KEY, hs) // ensure it survives the redirect
+      const client = createClient({ baseUrl: hs })
       const redirect = window.location.href
       const url = client.getSsoLoginUrl(redirect)
       window.location.assign(url)
