@@ -11,7 +11,6 @@ import {
   createClient,
   MatrixClient,
   Room,
-  MatrixEvent,
 } from 'matrix-js-sdk'
 
 type RawLoginResult = {
@@ -27,13 +26,11 @@ type MatrixCtx = {
   rooms: Room[]
   homeserver: string | null
 
-  // Auth
   initPasswordLogin(args:{ homeserver:string; user:string; pass:string }): Promise<void>
   finishSsoLoginWithToken(args:{ homeserver:string; token:string }): Promise<void>
   startWithAccessToken(args:{ homeserver:string; userId:string; accessToken:string; deviceId?:string }): Promise<void>
   logout(): Promise<void>
 
-  // History / crypto helpers
   paginateBack(roomId: string, batches?: number, limitPerBatch?: number): Promise<number>
   importRoomKeysFromFile(file: File): Promise<void>
   exportRoomKeysToFile(filename?: string): Promise<void>
@@ -42,18 +39,19 @@ type MatrixCtx = {
 }
 
 const HS_STORAGE_KEY = 'vanish.homeserver'
-const SESSION_KEY   = 'vanish.session' // { userId, accessToken, deviceId }
+const SESSION_KEY   = 'vanish.session'
 
 const Ctx = createContext<MatrixCtx | null>(null)
 
 /* ----------------- helpers ----------------- */
+
+const nonEmpty = (x:any): x is string => typeof x === 'string' && x.length>0
 
 function normalizeHs(input: string): string {
   const s = (input || '').trim()
   if (!s) return ''
   return /^https?:\/\//i.test(s) ? s : `https://${s}`
 }
-const nonEmpty = (x:any): x is string => typeof x === 'string' && x.length>0
 
 function normalizeLoginResult(raw: RawLoginResult): LoginResult {
   const userId      = raw.userId      ?? raw.user_id
@@ -99,6 +97,37 @@ async function replaceAndStart(
   await start(newClient)
 }
 
+/** Ensure crypto engine (Rust preferred; Olm fallback) is initialised BEFORE startClient */
+async function ensureCrypto(client: MatrixClient): Promise<boolean> {
+  // Try Rust Crypto
+  try {
+    // Importing the wasm package ensures bundlers include it.
+    await import('@matrix-org/matrix-sdk-crypto-wasm')
+    if ((client as any).initRustCrypto) {
+      await (client as any).initRustCrypto()
+      return true
+    }
+  } catch {
+    // ignore; fall back to Olm
+  }
+
+  // Fallback: JS Olm
+  try {
+    // Some builds expose .default; support both shapes
+    const OlmMod: any = await import('@matrix-org/olm')
+    const Olm = (OlmMod && (OlmMod.default || OlmMod)) || OlmMod
+    if (Olm?.init) await Olm.init()
+    ;(window as any).Olm = Olm
+    if ((client as any).initCrypto) {
+      await (client as any).initCrypto()
+      return true
+    }
+  } catch (e) {
+    console.warn('[Matrix] Olm fallback failed', e)
+  }
+  return false
+}
+
 /* -------------- provider/hook -------------- */
 
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
@@ -132,8 +161,8 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         try {
           const hasCrypto = !!(c as any).getCrypto?.()
           setCryptoEnabled(hasCrypto)
-          if (hasCrypto) {
-            const kb = await (c as any).isKeyBackupEnabled?.()
+          if (hasCrypto && (c as any).isKeyBackupEnabled) {
+            const kb = await (c as any).isKeyBackupEnabled()
             setKeyBackupEnabled(!!kb)
           }
         } catch {/* ignore */}
@@ -151,7 +180,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (startedRef.current) return
     startedRef.current = true
 
-    // ---- Persistent stores (history & crypto keys survive reloads)
+    // Persistent stores (best for history & crypto)
     try {
       const { IndexedDBStore } = await import('matrix-js-sdk/lib/store/indexeddb')
       const { IndexedDBCryptoStore } = await import('matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store')
@@ -162,24 +191,16 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable, continuing in-memory.', e)
     }
 
-    // ---- Enable E2EE (Rust first, JS fallback)
-    try {
-      if ((c as any).initRustCrypto) {
-        await (c as any).initRustCrypto()
-      } else if ((c as any).initCrypto) {
-        await (c as any).initCrypto()
-      }
-      setCryptoEnabled(!!(c as any).getCrypto?.())
-    } catch (e) {
-      console.warn('[Matrix] Crypto init failed; encrypted rooms may not decrypt.', e)
-    }
+    // Enable crypto (must be before startClient)
+    const enabled = await ensureCrypto(c)
+    setCryptoEnabled(enabled)
 
     bindClient(c)
 
     await c.startClient({
       initialSyncLimit: 50,
       lazyLoadMembers: true,
-      timelineSupport: true,              // <-- required for readable timelines
+      timelineSupport: true,
     })
   }
 
@@ -250,13 +271,15 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function importRoomKeysFromFile(file: File) {
     if (!client) return
+    if (!(client as any).getCrypto?.()) {
+      alert('Import failed: End-to-end encryption disabled')
+      return
+    }
     const text = await file.text()
     const passphrase = window.prompt('If the export was protected, enter its passphrase (or leave empty):') || undefined
     try {
-      // matrix-js-sdk accepts the Element export format (string) here
       await (client as any).importRoomKeys(text, { passphrase })
-      alert('Keys imported. Loading older messages…')
-      // After import, decrypting will happen on next timeline fetch/pagination
+      alert('Keys imported. Load older messages to decrypt history.')
     } catch (e:any) {
       alert('Import failed: ' + (e?.message ?? String(e)))
     }
@@ -264,6 +287,10 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function exportRoomKeysToFile(filename = 'vanish-room-keys.json') {
     if (!client) return
+    if (!(client as any).getCrypto?.()) {
+      alert('Export failed: End-to-end encryption disabled')
+      return
+    }
     try {
       const passphrase = window.prompt('Choose a passphrase to encrypt your export (recommended):') || undefined
       const data = await (client as any).exportRoomKeys({ passphrase })
