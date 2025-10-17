@@ -1,79 +1,150 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react'
-import * as sdk from 'matrix-js-sdk'
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createClient, MatrixClient, Room } from 'matrix-js-sdk'
 
-const HS = import.meta.env.VITE_MATRIX_HOMESERVER_URL
-
-type Ctx = {
-  client?: sdk.MatrixClient,
-  initPasswordLogin: (p: { homeserver: string, user: string, pass: string }) => Promise<void>,
-  initSSO: (p: { homeserver: string }) => void,
-  sendText: (roomId: string, body: string) => Promise<void>,
-  media: { secureWipe: () => Promise<void> }
+type LoginResult = {
+  accessToken: string
+  userId: string
+  deviceId?: string
+  wellKnown?: any
 }
 
-const MatrixCtx = createContext<Ctx>({
-  initPasswordLogin: async () => {},
-  initSSO: () => {},
-  sendText: async () => {},
-  media: { secureWipe: async () => {} }
-})
+type MatrixCtx = {
+  client: MatrixClient | null
+  ready: boolean
+  syncing: boolean
+  rooms: Room[]
+  homeserver: string | null
+
+  // login flows
+  initPasswordLogin(args: { homeserver: string; user: string; pass: string }): Promise<void>
+  finishSsoLoginWithToken(args: { homeserver: string; token: string }): Promise<void>
+
+  // restore existing session (optional)
+  startWithAccessToken(args: { homeserver: string; userId: string; accessToken: string; deviceId?: string }): Promise<void>
+
+  // logout
+  logout(): Promise<void>
+}
+
+const HS_STORAGE_KEY = 'vanish.homeserver'
+const SESSION_KEY = 'vanish.session' // stores {userId, accessToken, deviceId}
+
+const Ctx = createContext<MatrixCtx | null>(null)
+
+function normalizeHs(input: string): string {
+  const s = (input || '').trim()
+  if (!s) return ''
+  return /^https?:\/\//i.test(s) ? s : `https://${s}`
+}
+
+function sortRooms(rs: Room[]): Room[] {
+  return [...rs].sort((a, b) => (b.getLastActiveTs() || 0) - (a.getLastActiveTs() || 0))
+}
 
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
-  const [client, setClient] = useState<sdk.MatrixClient>()
+  const [client, setClient] = useState<MatrixClient | null>(null)
+  const [ready, setReady] = useState(false)
+  const [syncing, setSyncing] = useState(false)
+  const [rooms, setRooms] = useState<Room[]>([])
+  const [homeserver, setHomeserver] = useState<string | null>(null)
 
-  // restore session if present
-  useEffect(() => {
-    const accessToken = localStorage.getItem('mx_access_token')
-    const userId = localStorage.getItem('mx_user_id')
-    const deviceId = localStorage.getItem('mx_device_id')
-    if (accessToken && userId) {
-      const c = sdk.createClient({ baseUrl: HS, accessToken, userId, deviceId })
-      c.startClient({ initialSyncLimit: 20 })
-      setClient(c)
-    }
-  }, [])
+  const startedRef = useRef(false)
 
-  async function initPasswordLogin({ homeserver, user, pass }: { homeserver: string, user: string, pass: string }) {
-    const c = sdk.createClient({ baseUrl: homeserver })
-    const res = await c.login('m.login.password', { user, password: pass })
-    const client2 = sdk.createClient({ baseUrl: homeserver, accessToken: res.access_token, userId: res.user_id, deviceId: res.device_id })
-    localStorage.setItem('mx_access_token', res.access_token)
-    localStorage.setItem('mx_user_id', res.user_id)
-    localStorage.setItem('mx_device_id', res.device_id ?? '')
-    await client2.startClient({ initialSyncLimit: 20 })
-    setClient(client2)
-  }
+  // Helper to bind events and keep rooms fresh
+  function bindClient(c: MatrixClient) {
+    const refresh = () => setRooms(sortRooms(c.getVisibleRooms?.() ?? c.getRooms()))
+    c.on('Room', refresh)
+    c.on('Room.timeline', refresh)
+    c.on('Room.name', refresh)
+    c.on('Room.accountData', refresh)
+    c.on('deleteRoom', refresh)
+    c.on('Room.receipt', refresh)
 
-  function initSSO({ homeserver }: { homeserver: string }) {
-    const temp = sdk.createClient({ baseUrl: homeserver })
-    temp.loginWithRedirect({
-      baseUrl: homeserver,
-      idpId: undefined,
-      redirectUri: window.location.href
+    c.on('sync', (state) => {
+      if (state === 'PREPARED') {
+        setReady(true)
+        refresh()
+      }
+      setSyncing(state === 'SYNCING' || state === 'CATCHUP')
     })
   }
 
-  async function sendText(roomId: string, body: string) {
-    if (!client) throw new Error('Not ready')
-    await client.sendEvent(roomId, 'm.room.message', { msgtype: 'm.text', body })
+  async function start(c: MatrixClient) {
+    if (startedRef.current) return
+    startedRef.current = true
+    bindClient(c)
+    await c.startClient({ initialSyncLimit: 30, lazyLoadMembers: true })
   }
 
-  async function secureWipe() {
-    if (client) {
-      try { await client.stopClient() } catch {}
-      try { await (client as any).clearStores?.() } catch {}
-    }
-    localStorage.clear()
-    if ('databases' in indexedDB) {
-      // @ts-ignore
-      const dbs = await indexedDB.databases()
-      dbs.forEach((db:any) => db.name && indexedDB.deleteDatabase(db.name))
-    }
+  async function initPasswordLogin({ homeserver, user, pass }: { homeserver: string; user: string; pass: string }) {
+    const hs = normalizeHs(homeserver)
+    const c = createClient({ baseUrl: hs })
+    const res = await c.login('m.login.password', { user, password: pass }) as unknown as LoginResult
+    localStorage.setItem(HS_STORAGE_KEY, hs)
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }))
+    setHomeserver(hs)
+    setClient(c)
+    await start(c)
   }
 
-  const value = useMemo<Ctx>(() => ({ client, initPasswordLogin, initSSO, sendText, media: { secureWipe } }), [client])
+  async function finishSsoLoginWithToken({ homeserver, token }: { homeserver: string; token: string }) {
+    const hs = normalizeHs(homeserver)
+    const c = createClient({ baseUrl: hs })
+    const res = await c.loginWithToken(token) as unknown as LoginResult
+    localStorage.setItem(HS_STORAGE_KEY, hs)
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }))
+    setHomeserver(hs)
+    setClient(c)
+    await start(c)
+  }
 
-  return <MatrixCtx.Provider value={value}>{children}</MatrixCtx.Provider>
+  async function startWithAccessToken({ homeserver, userId, accessToken, deviceId }: { homeserver: string; userId: string; accessToken: string; deviceId?: string }) {
+    const hs = normalizeHs(homeserver)
+    const c = createClient({ baseUrl: hs, userId, accessToken, deviceId })
+    localStorage.setItem(HS_STORAGE_KEY, hs)
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId, accessToken, deviceId }))
+    setHomeserver(hs)
+    setClient(c)
+    await start(c)
+  }
+
+  async function logout() {
+    try { await client?.logout?.() } catch {}
+    try { await client?.stopClient?.() } catch {}
+    setClient(null)
+    setRooms([])
+    setReady(false)
+    setSyncing(false)
+    startedRef.current = false
+    localStorage.removeItem(SESSION_KEY)
+  }
+
+  // Auto-restore session on mount
+  useEffect(() => {
+    const hs = normalizeHs(localStorage.getItem(HS_STORAGE_KEY) || '')
+    const raw = localStorage.getItem(SESSION_KEY)
+    if (!hs || !raw) return
+    try {
+      const s = JSON.parse(raw)
+      setHomeserver(hs)
+      startWithAccessToken({ homeserver: hs, userId: s.userId, accessToken: s.accessToken, deviceId: s.deviceId })
+    } catch { /* ignore */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const value = useMemo<MatrixCtx>(() => ({
+    client, ready, syncing, rooms, homeserver,
+    initPasswordLogin,
+    finishSsoLoginWithToken,
+    startWithAccessToken,
+    logout,
+  }), [client, ready, syncing, rooms, homeserver])
+
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }
 
-export function useMatrix() { return useContext(MatrixCtx) }
+export function useMatrix(): MatrixCtx {
+  const v = useContext(Ctx)
+  if (!v) throw new Error('useMatrix must be used within <MatrixProvider>')
+  return v
+}
