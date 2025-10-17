@@ -13,6 +13,7 @@ import {
   Room,
 } from 'matrix-js-sdk'
 
+// ---- Types ----
 type RawLoginResult = {
   access_token?: string; user_id?: string; device_id?: string; well_known?: any
   accessToken?: string; userId?: string; deviceId?: string
@@ -34,25 +35,27 @@ type MatrixCtx = {
   paginateBack(roomId: string, batches?: number, limitPerBatch?: number): Promise<number>
   importRoomKeysFromFile(file: File): Promise<void>
   exportRoomKeysToFile(filename?: string): Promise<void>
+  restoreBackupWithRecoveryKey(recoveryKey: string): Promise<void>
+  refreshBackupStatus(): Promise<void>
+
   cryptoEnabled: boolean
   keyBackupEnabled: boolean
 }
 
+// ---- Local storage keys ----
 const HS_STORAGE_KEY = 'vanish.homeserver'
 const SESSION_KEY   = 'vanish.session'
 
+// ---- Context ----
 const Ctx = createContext<MatrixCtx | null>(null)
 
-/* ----------------- helpers ----------------- */
-
+// ---- Helpers ----
 const nonEmpty = (x:any): x is string => typeof x === 'string' && x.length>0
-
 function normalizeHs(input: string): string {
   const s = (input || '').trim()
   if (!s) return ''
   return /^https?:\/\//i.test(s) ? s : `https://${s}`
 }
-
 function normalizeLoginResult(raw: RawLoginResult): LoginResult {
   const userId      = raw.userId      ?? raw.user_id
   const accessToken = raw.accessToken ?? raw.access_token
@@ -60,7 +63,6 @@ function normalizeLoginResult(raw: RawLoginResult): LoginResult {
   if (!nonEmpty(userId) || !nonEmpty(accessToken)) throw new Error('SSO login failed: missing credentials')
   return { userId, accessToken, deviceId, wellKnown: raw.well_known }
 }
-
 function getRoomsArray(c: any): any[] {
   const rs = typeof c.getVisibleRooms === 'function' ? c.getVisibleRooms() : c.getRooms?.() || []
   return Array.isArray(rs) ? rs.filter(Boolean) : []
@@ -78,7 +80,6 @@ function lastActiveTs(r: any): number {
 function sortRoomsSafe(rs: any[]): any[] {
   return [...rs].sort((a,b)=> lastActiveTs(b) - lastActiveTs(a))
 }
-
 async function replaceAndStart(
   hs: string,
   creds: { userId:string; accessToken:string; deviceId?:string },
@@ -97,30 +98,29 @@ async function replaceAndStart(
   await start(newClient)
 }
 
-/** Ensure crypto engine (Rust preferred; Olm fallback) is initialised BEFORE startClient */
+// Ensure crypto (Rust preferred; Olm fallback). Returns true if enabled.
 async function ensureCrypto(client: MatrixClient): Promise<boolean> {
-  // Try Rust Crypto
+  // Prefer Rust Crypto (WASM)
   try {
-    // Importing the wasm package ensures bundlers include it.
+    // Ensure wasm package is bundled; matrix-js-sdk will load it from here.
     await import('@matrix-org/matrix-sdk-crypto-wasm')
     if ((client as any).initRustCrypto) {
       await (client as any).initRustCrypto()
-      return true
+      return !!(client as any).getCrypto?.()
     }
   } catch {
-    // ignore; fall back to Olm
+    // fall through to JS Olm
   }
 
   // Fallback: JS Olm
   try {
-    // Some builds expose .default; support both shapes
     const OlmMod: any = await import('@matrix-org/olm')
     const Olm = (OlmMod && (OlmMod.default || OlmMod)) || OlmMod
     if (Olm?.init) await Olm.init()
     ;(window as any).Olm = Olm
     if ((client as any).initCrypto) {
       await (client as any).initCrypto()
-      return true
+      return !!(client as any).getCrypto?.()
     }
   } catch (e) {
     console.warn('[Matrix] Olm fallback failed', e)
@@ -128,8 +128,7 @@ async function ensureCrypto(client: MatrixClient): Promise<boolean> {
   return false
 }
 
-/* -------------- provider/hook -------------- */
-
+// ---- Provider / Hook ----
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
   const [client, setClient] = useState<MatrixClient | null>(null)
   const [ready, setReady] = useState(false)
@@ -180,7 +179,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (startedRef.current) return
     startedRef.current = true
 
-    // Persistent stores (best for history & crypto)
+    // Persistent stores (history + crypto across reloads)
     try {
       const { IndexedDBStore } = await import('matrix-js-sdk/lib/store/indexeddb')
       const { IndexedDBCryptoStore } = await import('matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store')
@@ -191,7 +190,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable, continuing in-memory.', e)
     }
 
-    // Enable crypto (must be before startClient)
+    // Enable crypto BEFORE startClient
     const enabled = await ensureCrypto(c)
     setCryptoEnabled(enabled)
 
@@ -204,8 +203,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     })
   }
 
-  // ---------- LOGIN FLOWS ----------
-
+  // ---- Login flows ----
   async function initPasswordLogin({ homeserver, user, pass }:{
     homeserver:string; user:string; pass:string
   }) {
@@ -253,8 +251,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem(SESSION_KEY)
   }
 
-  // ---------- HISTORY & CRYPTO HELPERS ----------
-
+  // ---- History & crypto helpers ----
   async function paginateBack(roomId: string, batches = 10, limitPerBatch = 50): Promise<number> {
     if (!client) return 0
     const room = client.getRoom(roomId)
@@ -271,14 +268,20 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function importRoomKeysFromFile(file: File) {
     if (!client) return
-    if (!(client as any).getCrypto?.()) {
+    const crypto: any = (client as any).getCrypto?.()
+    if (!crypto && !(client as any).importRoomKeys) {
       alert('Import failed: End-to-end encryption disabled')
       return
     }
     const text = await file.text()
     const passphrase = window.prompt('If the export was protected, enter its passphrase (or leave empty):') || undefined
     try {
-      await (client as any).importRoomKeys(text, { passphrase })
+      if (crypto?.importRoomKeys) {
+        await crypto.importRoomKeys(text, { passphrase })
+      } else {
+        // legacy on MatrixClient
+        await (client as any).importRoomKeys(text, { passphrase })
+      }
       alert('Keys imported. Load older messages to decrypt history.')
     } catch (e:any) {
       alert('Import failed: ' + (e?.message ?? String(e)))
@@ -287,13 +290,16 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function exportRoomKeysToFile(filename = 'vanish-room-keys.json') {
     if (!client) return
-    if (!(client as any).getCrypto?.()) {
+    const crypto: any = (client as any).getCrypto?.()
+    if (!crypto && !(client as any).exportRoomKeys) {
       alert('Export failed: End-to-end encryption disabled')
       return
     }
     try {
       const passphrase = window.prompt('Choose a passphrase to encrypt your export (recommended):') || undefined
-      const data = await (client as any).exportRoomKeys({ passphrase })
+      const data = crypto?.exportRoomKeys
+        ? await crypto.exportRoomKeys({ passphrase })
+        : await (client as any).exportRoomKeys({ passphrase })
       const blob = new Blob([data], { type: 'application/json' })
       const a = document.createElement('a')
       a.href = URL.createObjectURL(blob)
@@ -305,7 +311,39 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  // Auto-restore session on mount (only if valid)
+  async function restoreBackupWithRecoveryKey(recoveryKey: string) {
+    if (!client) throw new Error('No client')
+    const crypto: any = (client as any).getCrypto?.()
+    if (!crypto) throw new Error('Crypto not initialised')
+
+    const version = await crypto.getKeyBackupVersion?.()
+    if (!version) throw new Error('No key backup found on server')
+
+    if (crypto.restoreKeyBackupWithRecoveryKey) {
+      await crypto.restoreKeyBackupWithRecoveryKey(recoveryKey, undefined, version)
+    } else if (crypto.restoreKeyBackupWithSecretStorageKey) {
+      await crypto.restoreKeyBackupWithSecretStorageKey(recoveryKey, undefined, version)
+    } else {
+      throw new Error('This SDK build does not expose key-backup restore API')
+    }
+
+    if (crypto.isKeyBackupEnabled) {
+      const kb = await crypto.isKeyBackupEnabled()
+      setKeyBackupEnabled(!!kb)
+    }
+  }
+
+  async function refreshBackupStatus() {
+    if (!client) return
+    const crypto: any = (client as any).getCrypto?.()
+    if (!crypto) { setKeyBackupEnabled(false); return }
+    try {
+      const kb = await crypto.isKeyBackupEnabled?.()
+      setKeyBackupEnabled(!!kb)
+    } catch { /* ignore */ }
+  }
+
+  // ---- Auto-restore session on mount ----
   useEffect(() => {
     const hs  = normalizeHs(localStorage.getItem(HS_STORAGE_KEY) || '')
     const raw = localStorage.getItem(SESSION_KEY)
@@ -327,6 +365,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     client, ready, syncing, rooms, homeserver,
     initPasswordLogin, finishSsoLoginWithToken, startWithAccessToken, logout,
     paginateBack, importRoomKeysFromFile, exportRoomKeysToFile,
+    restoreBackupWithRecoveryKey, refreshBackupStatus,
     cryptoEnabled, keyBackupEnabled,
   }), [client, ready, syncing, rooms, homeserver, cryptoEnabled, keyBackupEnabled])
 

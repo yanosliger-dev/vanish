@@ -9,9 +9,7 @@ function normalizeHs(input: string): string {
   if (!s) return ''
   return /^https?:\/\//i.test(s) ? s : `https://${s}`
 }
-function isValidUrl(u: string): boolean {
-  try { new URL(u); return true } catch { return false }
-}
+function isValidUrl(u: string): boolean { try { new URL(u); return true } catch { return false } }
 
 export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
   const { initPasswordLogin, finishSsoLoginWithToken } = useMatrix()
@@ -28,39 +26,30 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
 
   const normalizedHs = useMemo(() => normalizeHs(homeserver), [homeserver])
 
-  useEffect(() => {
-    if (normalizedHs) localStorage.setItem(HS_STORAGE_KEY, normalizedHs)
-  }, [normalizedHs])
+  useEffect(() => { if (normalizedHs) localStorage.setItem(HS_STORAGE_KEY, normalizedHs) }, [normalizedHs])
 
-  // Finish SSO once per token
   useEffect(() => {
     const url = new URL(window.location.href)
     const hashParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : '')
     const token = hashParams.get('loginToken') || url.searchParams.get('loginToken')
     if (!token) return
-
     const guardKey = `${SSO_USED_PREFIX}${token}`
     if (sessionStorage.getItem(guardKey)) return
     sessionStorage.setItem(guardKey, '1')
 
     const hs = normalizeHs(localStorage.getItem(HS_STORAGE_KEY) || homeserver)
-    if (!isValidUrl(hs)) {
-      setError(`Invalid homeserver URL: "${hs || '(empty)'}"`)
-      return
-    }
+    if (!isValidUrl(hs)) { setError(`Invalid homeserver URL: "${hs || '(empty)'}"`); return }
 
     ;(async () => {
       try {
         setLoading(true)
         await finishSsoLoginWithToken({ homeserver: hs, token })
-        history.replaceState(null, '', url.origin + url.pathname) // clean URL
+        history.replaceState(null, '', url.origin + url.pathname)
         onLoggedIn()
       } catch (e: any) {
         sessionStorage.removeItem(guardKey)
         setError(e?.message ?? String(e))
-      } finally {
-        setLoading(false)
-      }
+      } finally { setLoading(false) }
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -68,34 +57,21 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
   async function doLogin(e: React.FormEvent) {
     e.preventDefault()
     setError(null)
-
-    const hs = normalizedHs
-    if (!isValidUrl(hs)) {
-      setError('Please enter a valid homeserver URL (e.g., https://synapse.example.com)')
-      return
-    }
-
+    if (!isValidUrl(normalizedHs)) { setError('Enter a valid homeserver URL'); return }
     try {
       setLoading(true)
-      await initPasswordLogin({ homeserver: hs, user, pass })
+      await initPasswordLogin({ homeserver: normalizedHs, user, pass })
       onLoggedIn()
-    } catch (e: any) {
-      setError(e?.message ?? String(e))
-    } finally {
-      setLoading(false)
-    }
+    } catch (e: any) { setError(e?.message ?? String(e)) }
+    finally { setLoading(false) }
   }
 
   function handleSSO() {
     setError(null)
-    const hs = normalizedHs
-    if (!isValidUrl(hs)) {
-      setError('Please enter a valid homeserver URL before using SSO.')
-      return
-    }
-    localStorage.setItem(HS_STORAGE_KEY, hs)
+    if (!isValidUrl(normalizedHs)) { setError('Enter a valid homeserver URL before using SSO.'); return }
+    localStorage.setItem(HS_STORAGE_KEY, normalizedHs)
     const redirect = window.location.href
-    const ssoUrl = `${hs.replace(/\/+$/, '')}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirect)}`
+    const ssoUrl = `${normalizedHs.replace(/\/+$/, '')}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirect)}`
     window.location.assign(ssoUrl)
   }
 
@@ -104,21 +80,13 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
       <h1>{import.meta.env.VITE_APP_NAME}</h1>
       <form onSubmit={doLogin}>
         <label>Homeserver</label>
-        <input
-          type="text"
-          placeholder="https://synapse.your-domain.tld"
-          value={homeserver}
-          onChange={(e) => setHomeserver(e.target.value)}
-          style={{ width: '100%' }}
-        />
-
+        <input className="input" type="text" placeholder="https://synapse.your-domain.tld"
+               value={homeserver} onChange={(e)=>setHomeserver(e.target.value)} />
         <label>Username</label>
-        <input value={user} onChange={(e) => setUser(e.target.value)} style={{ width: '100%' }} />
-
+        <input className="input" value={user} onChange={(e)=>setUser(e.target.value)} />
         <label>Password</label>
-        <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} style={{ width: '100%' }} />
-
-        <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <input className="input" type="password" value={pass} onChange={(e)=>setPass(e.target.value)} />
+        <div style={{ display:'flex', gap:8, marginTop:12 }}>
           <button className="btn" disabled={loading} type="submit">Log in</button>
           <button className="btn" disabled={loading} type="button" onClick={handleSSO}>Use SSO</button>
         </div>

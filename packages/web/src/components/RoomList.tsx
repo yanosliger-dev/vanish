@@ -1,10 +1,7 @@
 import React, { useMemo, useState } from 'react'
 import { useMatrix } from '../matrix/client'
 
-type Props = {
-  activeRoomId: string | null
-  onSelect: (roomId: string) => void
-}
+type Props = { activeRoomId: string | null; onSelect: (roomId: string) => void }
 
 export default function RoomList({ activeRoomId, onSelect }: Props) {
   const { rooms, ready } = useMatrix()
@@ -24,36 +21,21 @@ export default function RoomList({ activeRoomId, onSelect }: Props) {
       </div>
 
       <div className="search">
-        <input
-          className="input"
-          placeholder="Search rooms…"
-          value={q}
-          onChange={e=>setQ(e.target.value)}
-        />
+        <input className="input" placeholder="Search rooms…" value={q} onChange={e=>setQ(e.target.value)} />
       </div>
 
       <div className="room-list">
         {!ready && <div className="footer-note">Syncing…</div>}
-        {ready && filtered.length === 0 && (
-          <div className="footer-note">No rooms. Create or join one in another client.</div>
-        )}
+        {ready && filtered.length === 0 && <div className="footer-note">No rooms.</div>}
         {filtered.map(r => {
           const lastTs = new Date((r as any).getLastActiveTs?.() || 0).toLocaleString()
           const encrypted = r.isEncrypted && r.isEncrypted()
-          // If you track unread: r.getUnreadNotificationCount('total')
           return (
-            <div
-              key={r.roomId}
-              className={`room ${activeRoomId === r.roomId ? 'active' : ''}`}
-              onClick={()=>onSelect(r.roomId)}
-              title={r.name || r.roomId}
-            >
-              <div className="room-title">
-                {encrypted ? '🔐 ' : ''}{r.name || r.roomId}
-              </div>
-              <div className="room-meta">
-                <span>{lastTs !== 'Invalid Date' ? lastTs : '—'}</span>
-              </div>
+            <div key={r.roomId}
+                 className={`room ${activeRoomId === r.roomId ? 'active' : ''}`}
+                 onClick={()=>onSelect(r.roomId)} title={r.name || r.roomId}>
+              <div className="room-title">{encrypted ? '🔐 ' : ''}{r.name || r.roomId}</div>
+              <div className="room-meta"><span>{lastTs !== 'Invalid Date' ? lastTs : '—'}</span></div>
             </div>
           )
         })}

@@ -2,12 +2,16 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useMatrix } from '../matrix/client'
 import type { MatrixEvent, Room } from 'matrix-js-sdk'
 
-type Props = {
-  activeRoomId: string | null
-}
+type Props = { activeRoomId: string | null }
 
 export default function RoomView({ activeRoomId }: Props) {
-  const { client, rooms, ready, paginateBack, cryptoEnabled, keyBackupEnabled, importRoomKeysFromFile, exportRoomKeysToFile } = useMatrix()
+  const {
+    client, rooms, ready, paginateBack,
+    cryptoEnabled, keyBackupEnabled,
+    importRoomKeysFromFile, exportRoomKeysToFile,
+    restoreBackupWithRecoveryKey, refreshBackupStatus,
+  } = useMatrix()
+
   const room: Room | undefined = useMemo(
     () => rooms.find(r => r.roomId === activeRoomId),
     [rooms, activeRoomId]
@@ -18,11 +22,9 @@ export default function RoomView({ activeRoomId }: Props) {
   const [sending, setSending] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  // pull/live updates
   useEffect(() => {
     if (!client || !room) return
     const refresh = () => setEvents(room.getLiveTimeline().getEvents())
-
     refresh()
     const onTimeline = (_ev: MatrixEvent, r: Room) => { if (r.roomId === room.roomId) refresh() }
     client.on('Room.timeline', onTimeline)
@@ -54,7 +56,6 @@ export default function RoomView({ activeRoomId }: Props) {
     if (type === 'm.room.encrypted') {
       const failed = (ev as any).isDecryptionFailure?.()
       if (failed) return '🔒 Unable to decrypt (import keys / verify another device)'
-      // decrypted events are re-emitted as m.room.message; we still show a placeholder
       return '🔒 Encrypted…'
     }
     if (type === 'm.room.message') {
@@ -78,11 +79,19 @@ export default function RoomView({ activeRoomId }: Props) {
       setSending(false)
     }
   }
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
+  }
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendMessage()
+  async function handleRestoreFromRecoveryKey() {
+    const key = window.prompt('Enter your Security Key (recovery key) to restore backup:')
+    if (!key) return
+    try {
+      await restoreBackupWithRecoveryKey(key.trim())
+      await refreshBackupStatus()
+      alert('Backup restored. Load older messages to decrypt history.')
+    } catch (e:any) {
+      alert('Restore failed: ' + (e?.message ?? String(e)))
     }
   }
 
@@ -106,6 +115,7 @@ export default function RoomView({ activeRoomId }: Props) {
                        onChange={e => { const f = e.target.files?.[0]; if (f) importRoomKeysFromFile(f) }} />
               </label>
               <button className="btn ghost" onClick={()=>exportRoomKeysToFile()}>Export keys</button>
+              <button className="btn ghost" onClick={handleRestoreFromRecoveryKey}>Restore from recovery key</button>
             </>
           )}
         </div>
@@ -128,7 +138,7 @@ export default function RoomView({ activeRoomId }: Props) {
 
       <div className="composer">
         <textarea ref={inputRef} className="textarea" placeholder="Write a message… (Enter to send, Shift+Enter for newline)" onKeyDown={onKeyDown}/>
-        <button className="btn" disabled={sending} onClick={sendMessage}>{sending ? 'Sending…' : 'Send'}</button>
+        <button className="btn" onClick={sendMessage}>Send</button>
       </div>
     </div>
   )
