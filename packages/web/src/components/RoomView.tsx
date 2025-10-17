@@ -1,83 +1,135 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useMatrix } from '../matrix/client'
-import { getEffectiveRetentionForRoom, scheduleRetentionGC } from '../matrix/retention'
-import RetentionBadge from './RetentionBadge'
-import CallButton from './CallButton'
+import type { MatrixEvent, Room } from 'matrix-js-sdk'
 
-export default function RoomView() {
-  const { client, sendText, media } = useMatrix()
-  const [roomId, setRoomId] = useState<string | null>(null)
-  const [events, setEvents] = useState<any[]>([])
-  const [retentionMs, setRetentionMs] = useState<number | undefined>(undefined)
-  const [ephemeral, setEphemeral] = useState(false)
+type Props = {
+  activeRoomId: string | null
+}
 
+export default function RoomView({ activeRoomId }: Props) {
+  const { client, rooms, ready, paginateBack, cryptoEnabled, keyBackupEnabled, importRoomKeysFromFile, exportRoomKeysToFile } = useMatrix()
+  const room: Room | undefined = useMemo(
+    () => rooms.find(r => r.roomId === activeRoomId),
+    [rooms, activeRoomId]
+  )
+
+  const [events, setEvents] = useState<MatrixEvent[]>([])
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const [sending, setSending] = useState(false)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // pull/live updates
   useEffect(() => {
-    const handler = (e: Event) => setRoomId((e as CustomEvent<string>).detail)
-    window.addEventListener('vanish:set-room', handler as any)
-    return () => window.removeEventListener('vanish:set-room', handler as any)
-  }, [])
+    if (!client || !room) return
+    const refresh = () => setEvents(room.getLiveTimeline().getEvents())
 
-  useEffect(() => {
-    if (!client || !roomId) return
-    const room = client.getRoom(roomId)
-    if (!room) return
-
-    // Retention policy + GC
-    getEffectiveRetentionForRoom(client, roomId).then(({ maxLifetime }) => setRetentionMs(maxLifetime))
-    scheduleRetentionGC(client, roomId)
-
-    const updateTimeline = () => {
-      const tl = room.getLiveTimeline()
-      const msgs = tl.getEvents()
-        .filter((e:any) => e.getType() === 'm.room.message')
-        .map((e:any) => ({ id: e.getId(), sender: e.getSender(), body: e.getContent().body, ts: e.getTs() }))
-        .sort((a:any,b:any)=>a.ts-b.ts)
-      setEvents(msgs)
+    refresh()
+    const onTimeline = (_ev: MatrixEvent, r: Room) => { if (r.roomId === room.roomId) refresh() }
+    client.on('Room.timeline', onTimeline)
+    client.on('Room.name', refresh)
+    client.on('Room.accountData', refresh)
+    client.on('Room.receipt', refresh)
+    return () => {
+      client.removeListener('Room.timeline', onTimeline)
+      client.removeListener('Room.name', refresh)
+      client.removeListener('Room.accountData', refresh)
+      client.removeListener('Room.receipt', refresh)
     }
+  }, [client, room])
 
-    updateTimeline()
-    room.on('Room.timeline', updateTimeline)
-    return () => { room.removeListener('Room.timeline', updateTimeline) }
-  }, [client, roomId])
-
-  const inputRef = useRef<HTMLInputElement>(null)
-  const doSend = async () => {
-    if (!inputRef.current || !roomId) return
-    const text = inputRef.current.value.trim()
-    if (!text) return
-    await sendText(roomId, text)
-    inputRef.current.value = ''
+  async function loadOlder() {
+    if (!room) return
+    setLoadingOlder(true)
+    try {
+      const loaded = await paginateBack(room.roomId, 20, 60)
+      if (loaded === 0) console.info('No more history (retention/start reached).')
+    } finally {
+      setLoadingOlder(false)
+    }
   }
 
-  if (!client || !roomId) return <div className="main"></div>
+  function renderBody(ev: MatrixEvent): string | null {
+    const type = ev.getType()
+    const c: any = ev.getContent()
+    if (type === 'm.room.encrypted') {
+      const failed = (ev as any).isDecryptionFailure?.()
+      if (failed) return '🔒 Unable to decrypt (import keys / verify another device)'
+      // decrypted events are re-emitted as m.room.message; we still show a placeholder
+      return '🔒 Encrypted…'
+    }
+    if (type === 'm.room.message') {
+      if (c?.msgtype === 'm.text' || c?.msgtype === 'm.notice') return c.body ?? ''
+      return `[${c?.msgtype ?? 'message'}]`
+    }
+    if (type === 'm.room.member') return `${c?.membership ?? 'updated membership'}`
+    if (type === 'm.room.topic')  return `* set the topic to: ${c?.topic ?? ''}`
+    return null
+  }
+
+  async function sendMessage() {
+    if (!client || !room) return
+    const body = (inputRef.current?.value || '').trim()
+    if (!body) return
+    setSending(true)
+    try {
+      await client.sendEvent(room.roomId, 'm.room.message', { msgtype:'m.text', body })
+      if (inputRef.current) inputRef.current.value = ''
+    } finally {
+      setSending(false)
+    }
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendMessage()
+    }
+  }
+
+  if (!ready) return <div className="main"><div className="footer-note">Syncing…</div></div>
+  if (!room)  return <div className="main"><div className="footer-note">Select a room</div></div>
 
   return (
-    <>
-      <header className="header">
-        <div>
-          <strong>{client.getRoom(roomId)?.name ?? roomId}</strong>
-          {' '}<RetentionBadge maxLifetimeMs={retentionMs} ephemeral={ephemeral} />
+    <div className="main">
+      <div className="main-header">
+        <strong>{room.name || room.roomId}</strong>
+        <button className="btn secondary" onClick={loadOlder} disabled={loadingOlder}>
+          {loadingOlder ? 'Loading…' : 'Load older'}
+        </button>
+        <div style={{ marginLeft:'auto', display:'flex', gap:8, alignItems:'center' }}>
+          {cryptoEnabled && (
+            <>
+              <span className="footer-note">🔐 E2EE {keyBackupEnabled ? '(backup on)' : '(backup off)'}</span>
+              <label style={{ cursor:'pointer' }}>
+                <span className="btn ghost">Import keys…</span>
+                <input type="file" accept="application/json,.json,.txt" style={{ display:'none' }}
+                       onChange={e => { const f = e.target.files?.[0]; if (f) importRoomKeysFromFile(f) }} />
+              </label>
+              <button className="btn ghost" onClick={()=>exportRoomKeysToFile()}>Export keys</button>
+            </>
+          )}
         </div>
-        <div style={{ display:'flex', gap:8 }}>
-          <CallButton roomId={roomId} />
-          <button className="btn" onClick={()=>{ media.secureWipe(); location.reload() }}>Secure Wipe</button>
-          <label style={{ display:'inline-flex', alignItems:'center', gap:6 }}>
-            <input type="checkbox" checked={ephemeral} onChange={e=>setEphemeral(e.target.checked)} /> Ephemeral
-          </label>
-        </div>
-      </header>
-      <section className="messages">
-        {events.map(ev => (
-          <div key={ev.id} style={{ marginBottom: 8 }}>
-            <div style={{ fontSize: 12, opacity:.7 }}>{new Date(ev.ts).toLocaleString()} · {ev.sender}</div>
-            <div>{ev.body}</div>
-          </div>
-        ))}
-      </section>
-      <footer className="input">
-        <input ref={inputRef} style={{ flex:1 }} placeholder="Type a message…" />
-        <button className="btn" onClick={doSend}>Send</button>
-      </footer>
-    </>
+      </div>
+
+      <div className="timeline">
+        {events.map(ev => {
+          const body = renderBody(ev)
+          if (!body) return null
+          const sender = ev.getSender()
+          const ts = new Date(ev.getTs()).toLocaleString()
+          return (
+            <div key={ev.getId() || `${ev.getType()}-${ev.getTs()}-${Math.random()}`} className="event">
+              <div className="event-meta">{sender} — {ts}</div>
+              <div>{body}</div>
+            </div>
+          )
+        })}
+      </div>
+
+      <div className="composer">
+        <textarea ref={inputRef} className="textarea" placeholder="Write a message… (Enter to send, Shift+Enter for newline)" onKeyDown={onKeyDown}/>
+        <button className="btn" disabled={sending} onClick={sendMessage}>{sending ? 'Sending…' : 'Send'}</button>
+      </div>
+    </div>
   )
 }

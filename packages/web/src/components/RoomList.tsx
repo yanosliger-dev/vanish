@@ -1,32 +1,63 @@
-import React, { useEffect, useState } from 'react'
+import React, { useMemo, useState } from 'react'
 import { useMatrix } from '../matrix/client'
 
-export default function RoomList() {
-  const { client } = useMatrix()
-  const [rooms, setRooms] = useState<any[]>([])
+type Props = {
+  activeRoomId: string | null
+  onSelect: (roomId: string) => void
+}
 
-  useEffect(() => {
-    if (!client) return
-    const update = () => setRooms(client.getVisibleRooms().sort((a:any,b:any)=>a.name.localeCompare(b.name)))
-    update()
-    client.on('Room', update)
-    client.on('Room.name', update)
-    return () => { client.removeListener('Room', update); client.removeListener('Room.name', update) }
-  }, [client])
+export default function RoomList({ activeRoomId, onSelect }: Props) {
+  const { rooms, ready } = useMatrix()
+  const [q, setQ] = useState('')
+
+  const filtered = useMemo(() => {
+    const needle = q.trim().toLowerCase()
+    const base = rooms
+    if (!needle) return base
+    return base.filter(r => (r.name || r.roomId).toLowerCase().includes(needle))
+  }, [rooms, q])
 
   return (
-    <div>
-      <h3>Rooms</h3>
-      <ul style={{ listStyle:'none', padding:0 }}>
-        {rooms.map((r:any) => (
-          <li key={r.roomId}>
-            <button className="btn" style={{ width:'100%', textAlign:'left', marginBottom:6 }}
-              onClick={() => window.dispatchEvent(new CustomEvent('vanish:set-room', { detail: r.roomId }))}>
-              {r.name}
-            </button>
-          </li>
-        ))}
-      </ul>
+    <div className="sidebar">
+      <div className="side-header">
+        <div className="brand">{import.meta.env.VITE_APP_NAME || 'Vanish'}</div>
+      </div>
+
+      <div className="search">
+        <input
+          className="input"
+          placeholder="Search rooms…"
+          value={q}
+          onChange={e=>setQ(e.target.value)}
+        />
+      </div>
+
+      <div className="room-list">
+        {!ready && <div className="footer-note">Syncing…</div>}
+        {ready && filtered.length === 0 && (
+          <div className="footer-note">No rooms. Create or join one in another client.</div>
+        )}
+        {filtered.map(r => {
+          const lastTs = new Date((r as any).getLastActiveTs?.() || 0).toLocaleString()
+          const encrypted = r.isEncrypted && r.isEncrypted()
+          // If you track unread: r.getUnreadNotificationCount('total')
+          return (
+            <div
+              key={r.roomId}
+              className={`room ${activeRoomId === r.roomId ? 'active' : ''}`}
+              onClick={()=>onSelect(r.roomId)}
+              title={r.name || r.roomId}
+            >
+              <div className="room-title">
+                {encrypted ? '🔐 ' : ''}{r.name || r.roomId}
+              </div>
+              <div className="room-meta">
+                <span>{lastTs !== 'Invalid Date' ? lastTs : '—'}</span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
