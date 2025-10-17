@@ -45,23 +45,25 @@ export default function RoomView({ activeRoomId }: Props) {
     try {
       const loaded = await paginateBack(room.roomId, 20, 60)
       if (loaded === 0) console.info('No more history (retention/start reached).')
-    } finally {
-      setLoadingOlder(false)
-    }
+    } finally { setLoadingOlder(false) }
   }
 
   function renderBody(ev: MatrixEvent): string | null {
     const type = ev.getType()
     const c: any = ev.getContent()
+
     if (type === 'm.room.encrypted') {
       const failed = (ev as any).isDecryptionFailure?.()
-      if (failed) return '🔒 Unable to decrypt (import keys / verify another device)'
-      return '🔒 Encrypted…'
+      return failed ? '🔒 Unable to decrypt (import keys / verify another device)' : '🔒 Encrypted…'
     }
+
     if (type === 'm.room.message') {
+      // nice handling of the SDK's "m.bad.encrypted" placeholder
+      if (c?.msgtype === 'm.bad.encrypted') return '🔒 Encrypted…'
       if (c?.msgtype === 'm.text' || c?.msgtype === 'm.notice') return c.body ?? ''
       return `[${c?.msgtype ?? 'message'}]`
     }
+
     if (type === 'm.room.member') return `${c?.membership ?? 'updated membership'}`
     if (type === 'm.room.topic')  return `* set the topic to: ${c?.topic ?? ''}`
     return null
@@ -75,9 +77,7 @@ export default function RoomView({ activeRoomId }: Props) {
     try {
       await client.sendEvent(room.roomId, 'm.room.message', { msgtype:'m.text', body })
       if (inputRef.current) inputRef.current.value = ''
-    } finally {
-      setSending(false)
-    }
+    } finally { setSending(false) }
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
@@ -137,8 +137,10 @@ export default function RoomView({ activeRoomId }: Props) {
       </div>
 
       <div className="composer">
-        <textarea ref={inputRef} className="textarea" placeholder="Write a message… (Enter to send, Shift+Enter for newline)" onKeyDown={onKeyDown}/>
-        <button className="btn" onClick={sendMessage}>Send</button>
+        <textarea ref={inputRef} className="textarea"
+                  placeholder="Write a message… (Enter to send, Shift+Enter for newline)"
+                  onKeyDown={onKeyDown}/>
+        <button className="btn" onClick={sendMessage} disabled={sending}>{sending ? 'Sending…' : 'Send'}</button>
       </div>
     </div>
   )

@@ -73,20 +73,15 @@ async function replaceAndStart(
  *  2) Fallback to legacy OLM asm.js (no WASM required)
  */
 async function ensureCrypto(client: MatrixClient): Promise<boolean> {
-  // Try Rust crypto (WASM)
   try {
     await import('@matrix-org/matrix-sdk-crypto-wasm')
     if ((client as any).initRustCrypto) {
       await (client as any).initRustCrypto()
       return !!(client as any).getCrypto?.()
     }
-  } catch {
-    // WASM likely not served with the right MIME; ignore and fallback
-  }
+  } catch { /* fallback to asm.js */ }
 
-  // Fallback: OLM legacy (asm.js)
   try {
-    // IMPORTANT: use the legacy build which does not require WASM
     await import('@matrix-org/olm/olm_legacy.js')
     const Olm = (window as any).Olm
     if (Olm?.init) await Olm.init()
@@ -98,7 +93,6 @@ async function ensureCrypto(client: MatrixClient): Promise<boolean> {
   } catch (e) {
     console.warn('[Matrix] Failed to start legacy OLM crypto', e)
   }
-
   return false
 }
 
@@ -147,7 +141,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (startedRef.current) return
     startedRef.current = true
 
-    // Persistent stores (history + crypto across reloads)
+    // persistent stores
     try {
       const { IndexedDBStore } = await import('matrix-js-sdk/lib/store/indexeddb')
       const { IndexedDBCryptoStore } = await import('matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store')
@@ -158,7 +152,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable; using memory stores.', e)
     }
 
-    // Enable crypto BEFORE startClient
     const enabled = await ensureCrypto(c)
     setCryptoEnabled(enabled)
 
@@ -232,6 +225,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     return loaded
   }
 
+  // <— tightened: try all import APIs and data shapes (string + parsed JSON)
   async function importRoomKeysFromFile(file: File) {
     if (!client) return
     const crypto: any = (client as any).getCrypto?.()
@@ -240,12 +234,25 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       return
     }
     const text = await file.text()
-    const passphrase = window.prompt('If the export was protected, enter its passphrase (or leave empty):') || undefined
-    try {
-      if (crypto?.importRoomKeys) await crypto.importRoomKeys(text, { passphrase })
-      else await (client as any).importRoomKeys(text, { passphrase })
-      alert('Keys imported. Load older messages to decrypt history.')
-    } catch (e:any) { alert('Import failed: ' + (e?.message ?? String(e))) }
+    let parsed: any = null
+    try { parsed = JSON.parse(text) } catch { /* not JSON array; keep string */ }
+
+    const tryPaths: Array<() => Promise<any>> = []
+    if (crypto?.importRoomKeys) {
+      tryPaths.push(() => crypto.importRoomKeys(text,   { passphrase: undefined }))
+      if (parsed) tryPaths.push(() => crypto.importRoomKeys(parsed, { passphrase: undefined }))
+    }
+    if ((client as any).importRoomKeys) {
+      tryPaths.push(() => (client as any).importRoomKeys(text,   { passphrase: undefined }))
+      if (parsed) tryPaths.push(() => (client as any).importRoomKeys(parsed, { passphrase: undefined }))
+    }
+
+    let lastErr: any = null
+    for (const fn of tryPaths) {
+      try { await fn(); alert('Keys imported. Load older messages to decrypt history.'); return }
+      catch (e) { lastErr = e }
+    }
+    alert('Import failed: ' + (lastErr?.message ?? String(lastErr ?? 'unknown')))
   }
 
   async function exportRoomKeysToFile(filename = 'vanish-room-keys.json') {
@@ -269,7 +276,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (!client) throw new Error('No client')
     const crypto: any = (client as any).getCrypto?.()
     if (!crypto) throw new Error('Crypto not initialised')
-
     const version = await crypto.getKeyBackupVersion?.()
     if (!version) throw new Error('No key backup found on server')
 
@@ -291,10 +297,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (!client) return
     const crypto: any = (client as any).getCrypto?.()
     if (!crypto) { setKeyBackupEnabled(false); return }
-    try {
-      const kb = await crypto.isKeyBackupEnabled?.()
-      setKeyBackupEnabled(!!kb)
-    } catch { /* ignore */ }
+    try { const kb = await crypto.isKeyBackupEnabled?.(); setKeyBackupEnabled(!!kb) } catch {}
   }
 
   // ---------- Auto-restore session ----------
@@ -307,9 +310,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       if (!nonEmpty(s.userId) || !nonEmpty(s.accessToken)) { localStorage.removeItem(SESSION_KEY); return }
       setHomeserver(hs)
       startWithAccessToken({ homeserver: hs, userId: s.userId, accessToken: s.accessToken, deviceId: s.deviceId })
-    } catch {
-      localStorage.removeItem(SESSION_KEY)
-    }
+    } catch { localStorage.removeItem(SESSION_KEY) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
