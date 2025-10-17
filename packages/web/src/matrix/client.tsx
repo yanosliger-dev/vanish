@@ -9,6 +9,18 @@ import React, {
 } from 'react'
 import { createClient, MatrixClient, Room } from 'matrix-js-sdk'
 
+type RawLoginResult = {
+  // Synapse typically returns snake_case
+  access_token?: string
+  user_id?: string
+  device_id?: string
+  well_known?: any
+  // In case some wrapper already camelCases
+  accessToken?: string
+  userId?: string
+  deviceId?: string
+}
+
 type LoginResult = {
   accessToken: string
   userId: string
@@ -61,8 +73,19 @@ function isNonEmptyString(x: any): x is string {
   return typeof x === 'string' && x.length > 0
 }
 
-function isValidSession(s: any): s is { userId: string; accessToken: string; deviceId?: string } {
-  return s && isNonEmptyString(s.userId) && isNonEmptyString(s.accessToken)
+function normalizeLoginResult(raw: RawLoginResult): LoginResult {
+  const userId = raw.userId ?? raw.user_id
+  const accessToken = raw.accessToken ?? raw.access_token
+  const deviceId = raw.deviceId ?? raw.device_id
+  if (!isNonEmptyString(userId) || !isNonEmptyString(accessToken)) {
+    throw new Error('SSO login failed: missing credentials')
+  }
+  return {
+    userId,
+    accessToken,
+    deviceId,
+    wellKnown: raw.well_known,
+  }
 }
 
 function getRoomsArray(c: any): any[] {
@@ -145,7 +168,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }
 
   async function start(c: MatrixClient) {
-    // Guard: do not start if no access token
     const token = (c as any).getAccessToken?.() ?? (c as any).accessToken
     if (!isNonEmptyString(token)) {
       console.warn('[Matrix] start() aborted: no access token on client')
@@ -170,18 +192,29 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }) {
     const hs = normalizeHs(homeserver)
     const temp = createClient({ baseUrl: hs })
-    const res = (await temp.login('m.login.password', {
+    const raw = (await temp.login('m.login.password', {
       user,
       password: pass,
-    })) as unknown as LoginResult
-
-    const sess = { userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }
-    if (!isValidSession(sess)) throw new Error('Login failed: missing credentials')
+    })) as RawLoginResult
+    const res = normalizeLoginResult(raw)
 
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify(sess))
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        userId: res.userId,
+        accessToken: res.accessToken,
+        deviceId: res.deviceId,
+      }),
+    )
 
-    await replaceAndStart(hs, sess, setHomeserver, setClient, start)
+    await replaceAndStart(
+      hs,
+      { userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId },
+      setHomeserver,
+      setClient,
+      start,
+    )
   }
 
   async function finishSsoLoginWithToken({
@@ -193,15 +226,26 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }) {
     const hs = normalizeHs(homeserver)
     const temp = createClient({ baseUrl: hs })
-    const res = (await temp.loginWithToken(token)) as unknown as LoginResult
-
-    const sess = { userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }
-    if (!isValidSession(sess)) throw new Error('SSO login failed: missing credentials')
+    const raw = (await temp.loginWithToken(token)) as RawLoginResult
+    const res = normalizeLoginResult(raw)
 
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify(sess))
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        userId: res.userId,
+        accessToken: res.accessToken,
+        deviceId: res.deviceId,
+      }),
+    )
 
-    await replaceAndStart(hs, sess, setHomeserver, setClient, start)
+    await replaceAndStart(
+      hs,
+      { userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId },
+      setHomeserver,
+      setClient,
+      start,
+    )
   }
 
   async function startWithAccessToken({
@@ -222,7 +266,10 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     const hs = normalizeHs(homeserver)
     const c = createClient({ baseUrl: hs, userId, accessToken, deviceId })
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId, accessToken, deviceId }))
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ userId, accessToken, deviceId }),
+    )
     setHomeserver(hs)
     setClient(c)
     await start(c)
@@ -239,14 +286,14 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem(SESSION_KEY)
   }
 
-  // Auto-restore session on mount (only if *valid*)
+  // Auto-restore session on mount
   useEffect(() => {
     const hs = normalizeHs(localStorage.getItem(HS_STORAGE_KEY) || '')
     const raw = localStorage.getItem(SESSION_KEY)
     if (!hs || !raw) return
     try {
       const s = JSON.parse(raw)
-      if (!isValidSession(s)) {
+      if (!isNonEmptyString(s.userId) || !isNonEmptyString(s.accessToken)) {
         console.warn('[Matrix] Ignoring invalid cached session; clearing.')
         localStorage.removeItem(SESSION_KEY)
         return
