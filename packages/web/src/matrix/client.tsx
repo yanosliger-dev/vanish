@@ -1,4 +1,12 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
+// packages/web/src/matrix/client.tsx
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { createClient, MatrixClient, Room } from 'matrix-js-sdk'
 
 type LoginResult = {
@@ -15,21 +23,33 @@ type MatrixCtx = {
   rooms: Room[]
   homeserver: string | null
 
-  // login flows
-  initPasswordLogin(args: { homeserver: string; user: string; pass: string }): Promise<void>
-  finishSsoLoginWithToken(args: { homeserver: string; token: string }): Promise<void>
+  initPasswordLogin(args: {
+    homeserver: string
+    user: string
+    pass: string
+  }): Promise<void>
 
-  // restore existing session (optional)
-  startWithAccessToken(args: { homeserver: string; userId: string; accessToken: string; deviceId?: string }): Promise<void>
+  finishSsoLoginWithToken(args: {
+    homeserver: string
+    token: string
+  }): Promise<void>
 
-  // logout
+  startWithAccessToken(args: {
+    homeserver: string
+    userId: string
+    accessToken: string
+    deviceId?: string
+  }): Promise<void>
+
   logout(): Promise<void>
 }
 
 const HS_STORAGE_KEY = 'vanish.homeserver'
-const SESSION_KEY = 'vanish.session' // stores {userId, accessToken, deviceId}
+const SESSION_KEY = 'vanish.session' // { userId, accessToken, deviceId }
 
 const Ctx = createContext<MatrixCtx | null>(null)
+
+/* ----------------- helpers ----------------- */
 
 function normalizeHs(input: string): string {
   const s = (input || '').trim()
@@ -37,9 +57,37 @@ function normalizeHs(input: string): string {
   return /^https?:\/\//i.test(s) ? s : `https://${s}`
 }
 
-function sortRooms(rs: Room[]): Room[] {
-  return [...rs].sort((a, b) => (b.getLastActiveTs() || 0) - (a.getLastActiveTs() || 0))
+function getRoomsArray(c: any): any[] {
+  // Some SDK builds expose getVisibleRooms(); others only getRooms()
+  const rs =
+    typeof c.getVisibleRooms === 'function'
+      ? c.getVisibleRooms()
+      : c.getRooms?.() || []
+  return Array.isArray(rs) ? rs.filter(Boolean) : []
 }
+
+function lastActiveTs(r: any): number {
+  try {
+    if (r && typeof r.getLastActiveTs === 'function') {
+      const ts = r.getLastActiveTs()
+      return Number.isFinite(ts) ? ts : 0
+    }
+    // Fallback: try last event timestamp
+    const ev = r?.timeline?.[r.timeline.length - 1]
+    const ts =
+      (typeof ev?.getTs === 'function' && ev.getTs()) ||
+      ev?.event?.origin_server_ts
+    return Number.isFinite(ts) ? ts : 0
+  } catch {
+    return 0
+  }
+}
+
+function sortRoomsSafe(rs: any[]): any[] {
+  return [...rs].sort((a, b) => lastActiveTs(b) - lastActiveTs(a))
+}
+
+/* -------------- provider/hook -------------- */
 
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
   const [client, setClient] = useState<MatrixClient | null>(null)
@@ -50,9 +98,12 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   const startedRef = useRef(false)
 
-  // Helper to bind events and keep rooms fresh
   function bindClient(c: MatrixClient) {
-    const refresh = () => setRooms(sortRooms(c.getVisibleRooms?.() ?? c.getRooms()))
+    const refresh = () => {
+      const rs = getRoomsArray(c)
+      setRooms(sortRoomsSafe(rs) as Room[])
+    }
+
     c.on('Room', refresh)
     c.on('Room.timeline', refresh)
     c.on('Room.name', refresh)
@@ -76,41 +127,89 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     await c.startClient({ initialSyncLimit: 30, lazyLoadMembers: true })
   }
 
-  async function initPasswordLogin({ homeserver, user, pass }: { homeserver: string; user: string; pass: string }) {
+  async function initPasswordLogin({
+    homeserver,
+    user,
+    pass,
+  }: {
+    homeserver: string
+    user: string
+    pass: string
+  }) {
     const hs = normalizeHs(homeserver)
     const c = createClient({ baseUrl: hs })
-    const res = await c.login('m.login.password', { user, password: pass }) as unknown as LoginResult
+    const res = (await c.login('m.login.password', {
+      user,
+      password: pass,
+    })) as unknown as LoginResult
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }))
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        userId: res.userId,
+        accessToken: res.accessToken,
+        deviceId: res.deviceId,
+      }),
+    )
     setHomeserver(hs)
     setClient(c)
     await start(c)
   }
 
-  async function finishSsoLoginWithToken({ homeserver, token }: { homeserver: string; token: string }) {
+  async function finishSsoLoginWithToken({
+    homeserver,
+    token,
+  }: {
+    homeserver: string
+    token: string
+  }) {
     const hs = normalizeHs(homeserver)
     const c = createClient({ baseUrl: hs })
-    const res = await c.loginWithToken(token) as unknown as LoginResult
+    const res = (await c.loginWithToken(token)) as unknown as LoginResult
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }))
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        userId: res.userId,
+        accessToken: res.accessToken,
+        deviceId: res.deviceId,
+      }),
+    )
     setHomeserver(hs)
     setClient(c)
     await start(c)
   }
 
-  async function startWithAccessToken({ homeserver, userId, accessToken, deviceId }: { homeserver: string; userId: string; accessToken: string; deviceId?: string }) {
+  async function startWithAccessToken({
+    homeserver,
+    userId,
+    accessToken,
+    deviceId,
+  }: {
+    homeserver: string
+    userId: string
+    accessToken: string
+    deviceId?: string
+  }) {
     const hs = normalizeHs(homeserver)
     const c = createClient({ baseUrl: hs, userId, accessToken, deviceId })
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId, accessToken, deviceId }))
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ userId, accessToken, deviceId }),
+    )
     setHomeserver(hs)
     setClient(c)
     await start(c)
   }
 
   async function logout() {
-    try { await client?.logout?.() } catch {}
-    try { await client?.stopClient?.() } catch {}
+    try {
+      await client?.logout?.()
+    } catch {}
+    try {
+      await client?.stopClient?.()
+    } catch {}
     setClient(null)
     setRooms([])
     setReady(false)
@@ -127,18 +226,32 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     try {
       const s = JSON.parse(raw)
       setHomeserver(hs)
-      startWithAccessToken({ homeserver: hs, userId: s.userId, accessToken: s.accessToken, deviceId: s.deviceId })
-    } catch { /* ignore */ }
+      startWithAccessToken({
+        homeserver: hs,
+        userId: s.userId,
+        accessToken: s.accessToken,
+        deviceId: s.deviceId,
+      })
+    } catch {
+      // ignore parse errors
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const value = useMemo<MatrixCtx>(() => ({
-    client, ready, syncing, rooms, homeserver,
-    initPasswordLogin,
-    finishSsoLoginWithToken,
-    startWithAccessToken,
-    logout,
-  }), [client, ready, syncing, rooms, homeserver])
+  const value = useMemo<MatrixCtx>(
+    () => ({
+      client,
+      ready,
+      syncing,
+      rooms,
+      homeserver,
+      initPasswordLogin,
+      finishSsoLoginWithToken,
+      startWithAccessToken,
+      logout,
+    }),
+    [client, ready, syncing, rooms, homeserver],
+  )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }
