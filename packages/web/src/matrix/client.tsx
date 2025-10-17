@@ -58,7 +58,6 @@ function normalizeHs(input: string): string {
 }
 
 function getRoomsArray(c: any): any[] {
-  // Some SDK builds expose getVisibleRooms(); others only getRooms()
   const rs =
     typeof c.getVisibleRooms === 'function'
       ? c.getVisibleRooms()
@@ -72,7 +71,6 @@ function lastActiveTs(r: any): number {
       const ts = r.getLastActiveTs()
       return Number.isFinite(ts) ? ts : 0
     }
-    // Fallback: try last event timestamp
     const ev = r?.timeline?.[r.timeline.length - 1]
     const ts =
       (typeof ev?.getTs === 'function' && ev.getTs()) ||
@@ -85,6 +83,24 @@ function lastActiveTs(r: any): number {
 
 function sortRoomsSafe(rs: any[]): any[] {
   return [...rs].sort((a, b) => lastActiveTs(b) - lastActiveTs(a))
+}
+
+async function replaceAndStart(
+  hs: string,
+  creds: { userId: string; accessToken: string; deviceId?: string },
+  setHomeserver: (s: string) => void,
+  setClient: (c: MatrixClient) => void,
+  start: (c: MatrixClient) => Promise<void>,
+) {
+  const newClient = createClient({
+    baseUrl: hs,
+    userId: creds.userId,
+    accessToken: creds.accessToken,
+    deviceId: creds.deviceId,
+  })
+  setHomeserver(hs)
+  setClient(newClient)
+  await start(newClient)
 }
 
 /* -------------- provider/hook -------------- */
@@ -127,6 +143,9 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     await c.startClient({ initialSyncLimit: 30, lazyLoadMembers: true })
   }
 
+  // ---------- LOGIN FLOWS ----------
+
+  // Password login: use a temp client to login, then create a new authed client
   async function initPasswordLogin({
     homeserver,
     user,
@@ -137,11 +156,12 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     pass: string
   }) {
     const hs = normalizeHs(homeserver)
-    const c = createClient({ baseUrl: hs })
-    const res = (await c.login('m.login.password', {
+    const temp = createClient({ baseUrl: hs })
+    const res = (await temp.login('m.login.password', {
       user,
       password: pass,
     })) as unknown as LoginResult
+
     localStorage.setItem(HS_STORAGE_KEY, hs)
     localStorage.setItem(
       SESSION_KEY,
@@ -151,11 +171,17 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         deviceId: res.deviceId,
       }),
     )
-    setHomeserver(hs)
-    setClient(c)
-    await start(c)
+
+    await replaceAndStart(
+      hs,
+      { userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId },
+      setHomeserver,
+      setClient,
+      start,
+    )
   }
 
+  // SSO finish: exchange token, then create a new authed client
   async function finishSsoLoginWithToken({
     homeserver,
     token,
@@ -164,8 +190,9 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     token: string
   }) {
     const hs = normalizeHs(homeserver)
-    const c = createClient({ baseUrl: hs })
-    const res = (await c.loginWithToken(token)) as unknown as LoginResult
+    const temp = createClient({ baseUrl: hs })
+    const res = (await temp.loginWithToken(token)) as unknown as LoginResult
+
     localStorage.setItem(HS_STORAGE_KEY, hs)
     localStorage.setItem(
       SESSION_KEY,
@@ -175,11 +202,17 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         deviceId: res.deviceId,
       }),
     )
-    setHomeserver(hs)
-    setClient(c)
-    await start(c)
+
+    await replaceAndStart(
+      hs,
+      { userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId },
+      setHomeserver,
+      setClient,
+      start,
+    )
   }
 
+  // Session restore using stored token
   async function startWithAccessToken({
     homeserver,
     userId,
@@ -233,7 +266,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         deviceId: s.deviceId,
       })
     } catch {
-      // ignore parse errors
+      // ignore
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

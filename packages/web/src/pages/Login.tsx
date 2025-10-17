@@ -28,12 +28,11 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
 
   const normalizedHs = useMemo(() => normalizeHs(homeserver), [homeserver])
 
-  // Persist HS as the user types (survives SSO round-trip)
   useEffect(() => {
     if (normalizedHs) localStorage.setItem(HS_STORAGE_KEY, normalizedHs)
   }, [normalizedHs])
 
-  // Finish SSO if we returned with a loginToken (guarded)
+  // Finish SSO once per token
   useEffect(() => {
     const url = new URL(window.location.href)
     const hashParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : '')
@@ -54,8 +53,7 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
       try {
         setLoading(true)
         await finishSsoLoginWithToken({ homeserver: hs, token })
-        // Clean token from URL and notify parent
-        history.replaceState(null, '', url.origin + url.pathname)
+        history.replaceState(null, '', url.origin + url.pathname) // clean URL
         onLoggedIn()
       } catch (e: any) {
         sessionStorage.removeItem(guardKey)
@@ -95,14 +93,9 @@ export default function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
       setError('Please enter a valid homeserver URL before using SSO.')
       return
     }
-    // Build the URL using the same client the provider will use internally
-    // We can safely construct it via a simple pattern that matches matrix-js-sdk behaviour:
-    const redirect = window.location.href
-    // Let Synapse generate SSO URL via the discovery endpoint by sending user to /_matrix/client/r0/login
-    // BUT easiest is using the sdk. Since we don't create a separate client here,
-    // leverage the well-known format '/_matrix/client/v3/login' with redirect param:
-    const ssoUrl = `${hs.replace(/\/+$/, '')}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirect)}`
     localStorage.setItem(HS_STORAGE_KEY, hs)
+    const redirect = window.location.href
+    const ssoUrl = `${hs.replace(/\/+$/, '')}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirect)}`
     window.location.assign(ssoUrl)
   }
 
