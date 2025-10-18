@@ -73,14 +73,16 @@ async function replaceAndStart(
  *  2) Fallback to legacy OLM asm.js (no WASM required)
  */
 async function ensureCrypto(client: MatrixClient): Promise<boolean> {
+  // Rust crypto
   try {
     await import('@matrix-org/matrix-sdk-crypto-wasm')
     if ((client as any).initRustCrypto) {
       await (client as any).initRustCrypto()
-      return !!(client as any).getCrypto?.()
+      return !!((client as any).getCrypto?.() || (client as any).crypto)
     }
-  } catch { /* fallback to asm.js */ }
+  } catch { /* ignore; fallback below */ }
 
+  // Legacy OLM (asm.js) – does not require .wasm MIME support
   try {
     await import('@matrix-org/olm/olm_legacy.js')
     const Olm = (window as any).Olm
@@ -88,12 +90,16 @@ async function ensureCrypto(client: MatrixClient): Promise<boolean> {
     ;(window as any).Olm = Olm
     if ((client as any).initCrypto) {
       await (client as any).initCrypto()
-      return !!(client as any).getCrypto?.()
+      return !!((client as any).getCrypto?.() || (client as any).crypto)
     }
   } catch (e) {
     console.warn('[Matrix] Failed to start legacy OLM crypto', e)
   }
   return false
+}
+
+function getCryptoIface(c: MatrixClient): any | null {
+  return (c as any).getCrypto?.() || (c as any).crypto || null
 }
 
 /* -------------- provider/hook -------------- */
@@ -123,7 +129,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         setReady(true)
         refresh()
         try {
-          const hasCrypto = !!(c as any).getCrypto?.()
+          const hasCrypto = !!getCryptoIface(c)
           setCryptoEnabled(hasCrypto)
           if (hasCrypto && (c as any).isKeyBackupEnabled) {
             const kb = await (c as any).isKeyBackupEnabled()
@@ -152,6 +158,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable; using memory stores.', e)
     }
 
+    // Enable crypto BEFORE startClient
     const enabled = await ensureCrypto(c)
     setCryptoEnabled(enabled)
 
@@ -205,12 +212,24 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   async function logout() {
     try { await client?.logout?.() } catch {}
     try { await client?.stopClient?.() } catch {}
-    setClient(null); setRooms([]); setReady(false); setSyncing(false)
-    startedRef.current = false
+    // clear session & reload to reset everything cleanly
     localStorage.removeItem(SESSION_KEY)
+    window.location.reload()
   }
 
   // ---------- HISTORY & CRYPTO HELPERS ----------
+  async function maybeInitCrypto() {
+    if (!client) throw new Error('No client')
+    let crypto = getCryptoIface(client)
+    if (!crypto) {
+      const ok = await ensureCrypto(client)
+      setCryptoEnabled(ok)
+      crypto = getCryptoIface(client)
+    }
+    if (!crypto) throw new Error('Crypto not initialised')
+    return crypto
+  }
+
   async function paginateBack(roomId: string, batches = 10, limitPerBatch = 50): Promise<number> {
     if (!client) return 0
     const room = client.getRoom(roomId)
@@ -225,22 +244,19 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     return loaded
   }
 
-  // <— tightened: try all import APIs and data shapes (string + parsed JSON)
   async function importRoomKeysFromFile(file: File) {
     if (!client) return
-    const crypto: any = (client as any).getCrypto?.()
-    if (!crypto && !(client as any).importRoomKeys) {
-      alert('Import failed: End-to-end encryption disabled')
-      return
-    }
+    const crypto = await maybeInitCrypto().catch((e)=>{ alert('Import failed: ' + (e?.message ?? String(e))); return null })
+    if (!crypto && !(client as any).importRoomKeys) return
+
     const text = await file.text()
     let parsed: any = null
-    try { parsed = JSON.parse(text) } catch { /* not JSON array; keep string */ }
+    try { parsed = JSON.parse(text) } catch {}
 
     const tryPaths: Array<() => Promise<any>> = []
-    if (crypto?.importRoomKeys) {
-      tryPaths.push(() => crypto.importRoomKeys(text,   { passphrase: undefined }))
-      if (parsed) tryPaths.push(() => crypto.importRoomKeys(parsed, { passphrase: undefined }))
+    if ((crypto as any)?.importRoomKeys) {
+      tryPaths.push(() => (crypto as any).importRoomKeys(text,   { passphrase: undefined }))
+      if (parsed) tryPaths.push(() => (crypto as any).importRoomKeys(parsed, { passphrase: undefined }))
     }
     if ((client as any).importRoomKeys) {
       tryPaths.push(() => (client as any).importRoomKeys(text,   { passphrase: undefined }))
@@ -257,15 +273,13 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function exportRoomKeysToFile(filename = 'vanish-room-keys.json') {
     if (!client) return
-    const crypto: any = (client as any).getCrypto?.()
-    if (!crypto && !(client as any).exportRoomKeys) {
-      alert('Export failed: End-to-end encryption disabled')
-      return
-    }
+    const crypto = await maybeInitCrypto().catch((e)=>{ alert('Export failed: ' + (e?.message ?? String(e))); return null })
+    if (!crypto && !(client as any).exportRoomKeys) return
+
     try {
       const passphrase = window.prompt('Choose a passphrase to encrypt your export (recommended):') || undefined
-      const data = crypto?.exportRoomKeys
-        ? await crypto.exportRoomKeys({ passphrase })
+      const data = (crypto as any)?.exportRoomKeys
+        ? await (crypto as any).exportRoomKeys({ passphrase })
         : await (client as any).exportRoomKeys({ passphrase })
       const blob = new Blob([data], { type: 'application/json' })
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click(); URL.revokeObjectURL(a.href)
@@ -274,30 +288,34 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function restoreBackupWithRecoveryKey(recoveryKey: string) {
     if (!client) throw new Error('No client')
-    const crypto: any = (client as any).getCrypto?.()
-    if (!crypto) throw new Error('Crypto not initialised')
-    const version = await crypto.getKeyBackupVersion?.()
-    if (!version) throw new Error('No key backup found on server')
+    const crypto = await maybeInitCrypto() // throws if still not initialised
 
-    if (crypto.restoreKeyBackupWithRecoveryKey) {
-      await crypto.restoreKeyBackupWithRecoveryKey(recoveryKey, undefined, version)
-    } else if (crypto.restoreKeyBackupWithSecretStorageKey) {
-      await crypto.restoreKeyBackupWithSecretStorageKey(recoveryKey, undefined, version)
+    const version =
+      (crypto as any).getKeyBackupVersion?.() ??
+      (client as any).getKeyBackupVersion?.?.()
+
+    const backup = await (version instanceof Promise ? version : (crypto as any).getKeyBackupVersion?.())
+    if (!backup) throw new Error('No key backup found on server')
+
+    if ((crypto as any).restoreKeyBackupWithRecoveryKey) {
+      await (crypto as any).restoreKeyBackupWithRecoveryKey(recoveryKey, undefined, backup)
+    } else if ((crypto as any).restoreKeyBackupWithSecretStorageKey) {
+      await (crypto as any).restoreKeyBackupWithSecretStorageKey(recoveryKey, undefined, backup)
     } else {
       throw new Error('This SDK build does not expose key-backup restore API')
     }
 
-    if (crypto.isKeyBackupEnabled) {
-      const kb = await crypto.isKeyBackupEnabled()
+    if ((crypto as any).isKeyBackupEnabled) {
+      const kb = await (crypto as any).isKeyBackupEnabled()
       setKeyBackupEnabled(!!kb)
     }
   }
 
   async function refreshBackupStatus() {
     if (!client) return
-    const crypto: any = (client as any).getCrypto?.()
+    const crypto = getCryptoIface(client)
     if (!crypto) { setKeyBackupEnabled(false); return }
-    try { const kb = await crypto.isKeyBackupEnabled?.(); setKeyBackupEnabled(!!kb) } catch {}
+    try { const kb = await (crypto as any).isKeyBackupEnabled?.(); setKeyBackupEnabled(!!kb) } catch {}
   }
 
   // ---------- Auto-restore session ----------

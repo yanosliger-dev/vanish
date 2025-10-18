@@ -10,6 +10,7 @@ export default function RoomView({ activeRoomId }: Props) {
     cryptoEnabled, keyBackupEnabled,
     importRoomKeysFromFile, exportRoomKeysToFile,
     restoreBackupWithRecoveryKey, refreshBackupStatus,
+    logout,
   } = useMatrix()
 
   const room: Room | undefined = useMemo(
@@ -58,7 +59,6 @@ export default function RoomView({ activeRoomId }: Props) {
     }
 
     if (type === 'm.room.message') {
-      // nice handling of the SDK's "m.bad.encrypted" placeholder
       if (c?.msgtype === 'm.bad.encrypted') return '🔒 Encrypted…'
       if (c?.msgtype === 'm.text' || c?.msgtype === 'm.notice') return c.body ?? ''
       return `[${c?.msgtype ?? 'message'}]`
@@ -102,9 +102,11 @@ export default function RoomView({ activeRoomId }: Props) {
     <div className="main">
       <div className="main-header">
         <strong>{room.name || room.roomId}</strong>
+
         <button className="btn secondary" onClick={loadOlder} disabled={loadingOlder}>
           {loadingOlder ? 'Loading…' : 'Load older'}
         </button>
+
         <div style={{ marginLeft:'auto', display:'flex', gap:8, alignItems:'center' }}>
           {cryptoEnabled && (
             <>
@@ -118,6 +120,9 @@ export default function RoomView({ activeRoomId }: Props) {
               <button className="btn ghost" onClick={handleRestoreFromRecoveryKey}>Restore from recovery key</button>
             </>
           )}
+
+          {/* Logout always available */}
+          <button className="btn" onClick={logout}>Log out</button>
         </div>
       </div>
 
