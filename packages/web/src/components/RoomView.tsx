@@ -9,7 +9,7 @@ export default function RoomView({ activeRoomId }: Props) {
     client, rooms, ready, paginateBack,
     cryptoEnabled, keyBackupEnabled,
     importRoomKeysFromFile, exportRoomKeysToFile,
-    restoreBackupWithRecoveryKey, refreshBackupStatus,
+    ensureRoomEncrypted,
     logout,
   } = useMatrix()
 
@@ -21,7 +21,10 @@ export default function RoomView({ activeRoomId }: Props) {
   const [events, setEvents] = useState<MatrixEvent[]>([])
   const [loadingOlder, setLoadingOlder] = useState(false)
   const [sending, setSending] = useState(false)
+  const [encrypting, setEncrypting] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  const isEncrypted = room?.isEncrypted && room.isEncrypted()
 
   useEffect(() => {
     if (!client || !room) return
@@ -55,7 +58,7 @@ export default function RoomView({ activeRoomId }: Props) {
 
     if (type === 'm.room.encrypted') {
       const failed = (ev as any).isDecryptionFailure?.()
-      return failed ? '🔒 Unable to decrypt (import keys / verify another device)' : '🔒 Encrypted…'
+      return failed ? '🔒 Unable to decrypt (missing keys)' : '🔒 Encrypted…'
     }
 
     if (type === 'm.room.message') {
@@ -69,8 +72,30 @@ export default function RoomView({ activeRoomId }: Props) {
     return null
   }
 
+  async function encryptRoomNow() {
+    if (!room) return
+    setEncrypting(true)
+    try {
+      await ensureRoomEncrypted(room.roomId)
+      alert('Room encryption enabled. New messages will be end-to-end encrypted.')
+    } catch (e:any) {
+      alert('Failed to enable encryption: ' + (e?.message ?? String(e)))
+    } finally {
+      setEncrypting(false)
+    }
+  }
+
   async function sendMessage() {
     if (!client || !room) return
+    if (!room.isEncrypted?.() && !confirm('This room is not encrypted. Encrypt it now?')) {
+      // guard: refuse to send plaintext by default
+      return
+    }
+    if (!room.isEncrypted?.()) {
+      await encryptRoomNow()
+      if (!room.isEncrypted?.()) return // still not encrypted? abort send
+    }
+
     const body = (inputRef.current?.value || '').trim()
     if (!body) return
     setSending(true)
@@ -83,18 +108,6 @@ export default function RoomView({ activeRoomId }: Props) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
   }
 
-  async function handleRestoreFromRecoveryKey() {
-    const key = window.prompt('Enter your Security Key (recovery key) to restore backup:')
-    if (!key) return
-    try {
-      await restoreBackupWithRecoveryKey(key.trim())
-      await refreshBackupStatus()
-      alert('Backup restored. Load older messages to decrypt history.')
-    } catch (e:any) {
-      alert('Restore failed: ' + (e?.message ?? String(e)))
-    }
-  }
-
   if (!ready) return <div className="main"><div className="footer-note">Syncing…</div></div>
   if (!room)  return <div className="main"><div className="footer-note">Select a room</div></div>
 
@@ -102,29 +115,38 @@ export default function RoomView({ activeRoomId }: Props) {
     <div className="main">
       <div className="main-header">
         <strong>{room.name || room.roomId}</strong>
-
         <button className="btn secondary" onClick={loadOlder} disabled={loadingOlder}>
           {loadingOlder ? 'Loading…' : 'Load older'}
         </button>
 
         <div style={{ marginLeft:'auto', display:'flex', gap:8, alignItems:'center' }}>
-          {cryptoEnabled && (
-            <>
-              <span className="footer-note">🔐 E2EE {keyBackupEnabled ? '(backup on)' : '(backup off)'}</span>
-              <label style={{ cursor:'pointer' }}>
-                <span className="btn ghost">Import keys…</span>
-                <input type="file" accept="application/json,.json,.txt" style={{ display:'none' }}
-                       onChange={e => { const f = e.target.files?.[0]; if (f) importRoomKeysFromFile(f) }} />
-              </label>
-              <button className="btn ghost" onClick={()=>exportRoomKeysToFile()}>Export keys</button>
-              <button className="btn ghost" onClick={handleRestoreFromRecoveryKey}>Restore from recovery key</button>
-            </>
+          <span className="footer-note">
+            {isEncrypted ? '🔐 Encrypted' : '⚠️ Not encrypted'}
+            {' '}· Crypto {cryptoEnabled ? 'on' : 'off'}
+          </span>
+
+          {!isEncrypted && (
+            <button className="btn ghost" onClick={encryptRoomNow} disabled={encrypting}>
+              {encrypting ? 'Enabling…' : 'Encrypt this room'}
+            </button>
           )}
 
-          {/* Logout always available */}
+          <label style={{ cursor:'pointer' }}>
+            <span className="btn ghost">Import keys…</span>
+            <input type="file" accept="application/json,.json,.txt" style={{ display:'none' }}
+                   onChange={e => { const f = e.target.files?.[0]; if (f) importRoomKeysFromFile(f) }} />
+          </label>
+
+          <button className="btn ghost" onClick={()=>exportRoomKeysToFile()}>Export keys</button>
           <button className="btn" onClick={logout}>Log out</button>
         </div>
       </div>
+
+      {!isEncrypted && (
+        <div style={{ margin:'8px 0', padding:10, borderRadius:12, background:'rgba(255,200,0,0.08)', border:'1px solid rgba(255,200,0,0.25)' }}>
+          This room is not encrypted. Click <b>Encrypt this room</b> to enable end-to-end encryption (Megolm) for all new messages.
+        </div>
+      )}
 
       <div className="timeline">
         {events.map(ev => {
