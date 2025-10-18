@@ -245,31 +245,35 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }
 
   async function importRoomKeysFromFile(file: File) {
-    if (!client) return
-    const crypto = await maybeInitCrypto().catch((e)=>{ alert('Import failed: ' + (e?.message ?? String(e))); return null })
-    if (!crypto && !(client as any).importRoomKeys) return
+  if (!client) return
+  // Ensure crypto is running (Rust or legacy OLM)
+  const crypto = await maybeInitCrypto().catch((e)=>{ alert('Import failed: ' + (e?.message ?? String(e))); return null })
+  if (!crypto && !(client as any).importRoomKeys) return
 
-    const text = await file.text()
-    let parsed: any = null
-    try { parsed = JSON.parse(text) } catch {}
+  const text = await file.text()
+  let parsed: any = null
+  try { parsed = JSON.parse(text) } catch {}
 
-    const tryPaths: Array<() => Promise<any>> = []
-    if ((crypto as any)?.importRoomKeys) {
-      tryPaths.push(() => (crypto as any).importRoomKeys(text,   { passphrase: undefined }))
-      if (parsed) tryPaths.push(() => (crypto as any).importRoomKeys(parsed, { passphrase: undefined }))
-    }
-    if ((client as any).importRoomKeys) {
-      tryPaths.push(() => (client as any).importRoomKeys(text,   { passphrase: undefined }))
-      if (parsed) tryPaths.push(() => (client as any).importRoomKeys(parsed, { passphrase: undefined }))
-    }
+  // Ask for the Element export passphrase (blank is fine if you didn’t set one)
+  const passphrase = window.prompt('Enter export passphrase (leave empty if none):') || undefined
 
-    let lastErr: any = null
-    for (const fn of tryPaths) {
-      try { await fn(); alert('Keys imported. Load older messages to decrypt history.'); return }
-      catch (e) { lastErr = e }
-    }
-    alert('Import failed: ' + (lastErr?.message ?? String(lastErr ?? 'unknown')))
+  const tryPaths: Array<() => Promise<any>> = []
+  if ((crypto as any)?.importRoomKeys) {
+    tryPaths.push(() => (crypto as any).importRoomKeys(text,   { passphrase }))
+    if (parsed) tryPaths.push(() => (crypto as any).importRoomKeys(parsed, { passphrase }))
   }
+  if ((client as any).importRoomKeys) {
+    tryPaths.push(() => (client as any).importRoomKeys(text,   { passphrase }))
+    if (parsed) tryPaths.push(() => (client as any).importRoomKeys(parsed, { passphrase }))
+  }
+
+  let lastErr: any = null
+  for (const fn of tryPaths) {
+    try { await fn(); alert('Keys imported. Click “Load older” to decrypt history.'); return }
+    catch (e) { lastErr = e }
+  }
+  alert('Import failed: ' + (lastErr?.message ?? String(lastErr ?? 'unknown')))
+}
 
   async function exportRoomKeysToFile(filename = 'vanish-room-keys.json') {
     if (!client) return
