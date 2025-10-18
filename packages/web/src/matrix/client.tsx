@@ -287,29 +287,34 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }
 
   async function restoreBackupWithRecoveryKey(recoveryKey: string) {
-    if (!client) throw new Error('No client')
-    const crypto = await maybeInitCrypto() // throws if still not initialised
+  if (!client) throw new Error('No client')
 
-    const version =
-      (crypto as any).getKeyBackupVersion?.() ??
-      (client as any).getKeyBackupVersion?.?.()
+  // Make sure crypto is running (Rust or legacy OLM)
+  const crypto = await maybeInitCrypto() // throws if still not initialised
 
-    const backup = await (version instanceof Promise ? version : (crypto as any).getKeyBackupVersion?.())
-    if (!backup) throw new Error('No key backup found on server')
+  // The SDK exposes backup info on the *client* (not always on crypto).
+  // Different versions name it slightly differently; try both.
+  const getVersion =
+    (client as any).getKeyBackupVersion?.bind(client) ||
+    (client as any).getKeyBackupInfo?.bind(client);
 
-    if ((crypto as any).restoreKeyBackupWithRecoveryKey) {
-      await (crypto as any).restoreKeyBackupWithRecoveryKey(recoveryKey, undefined, backup)
-    } else if ((crypto as any).restoreKeyBackupWithSecretStorageKey) {
-      await (crypto as any).restoreKeyBackupWithSecretStorageKey(recoveryKey, undefined, backup)
-    } else {
-      throw new Error('This SDK build does not expose key-backup restore API')
-    }
+  const backup = getVersion ? await getVersion() : null
+  if (!backup) throw new Error('No key backup found on server')
 
-    if ((crypto as any).isKeyBackupEnabled) {
-      const kb = await (crypto as any).isKeyBackupEnabled()
-      setKeyBackupEnabled(!!kb)
-    }
+  // Restore using whichever API your sdk exposes
+  if ((crypto as any).restoreKeyBackupWithRecoveryKey) {
+    await (crypto as any).restoreKeyBackupWithRecoveryKey(recoveryKey, undefined, backup)
+  } else if ((crypto as any).restoreKeyBackupWithSecretStorageKey) {
+    await (crypto as any).restoreKeyBackupWithSecretStorageKey(recoveryKey, undefined, backup)
+  } else {
+    throw new Error('This SDK build does not expose key-backup restore API')
   }
+
+  if ((crypto as any).isKeyBackupEnabled) {
+    const kb = await (crypto as any).isKeyBackupEnabled()
+    setKeyBackupEnabled(!!kb)
+  }
+}
 
   async function refreshBackupStatus() {
     if (!client) return
