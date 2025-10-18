@@ -78,18 +78,18 @@ function hasCrypto(c: MatrixClient): boolean {
 /** Initialise the SDK crypto layer (Rust if available; else legacy OLM). DOES NOT start the client. */
 export async function ensureCrypto(client: any): Promise<boolean> {
   try {
-    if (client.getCrypto && client.getCrypto()) {
+    if (hasCrypto(client)) {
       console.log('[Vanish] Crypto already active.')
       return true
     }
 
-    // Prefer Rust crypto if this build exposes it
+    // Prefer Rust crypto if exposed by this build
     if (typeof client.initRustCrypto === 'function') {
       try {
         await import('@matrix-org/matrix-sdk-crypto-wasm')
         console.log('[Vanish] Initialising Rust crypto…')
         await client.initRustCrypto()
-        return !!client.getCrypto?.()
+        return hasCrypto(client)
       } catch (e) {
         console.warn('[Vanish] Rust crypto unavailable, falling back to legacy OLM.', e)
       }
@@ -112,7 +112,8 @@ export async function ensureCrypto(client: any): Promise<boolean> {
       return false
     }
 
-    return !!client.getCrypto?.()
+    // ✅ Use hasCrypto so both Rust + legacy paths are recognised
+    return hasCrypto(client)
   } catch (err) {
     console.error('[Vanish] ensureCrypto failed', err)
     return false
@@ -136,7 +137,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   const startedRef = useRef(false)
 
-  // If a client exists, we may refresh the crypto badge (safe: does not start client)
+  // If a client exists, refresh the crypto badge (safe: does not start client)
   useEffect(() => {
     if (!client) return
     let cancelled = false
@@ -203,6 +204,11 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       lazyLoadMembers: true,
       timelineSupport: true,
     })
+
+    // Nudge the badge after sync ticks in legacy OLM
+    setTimeout(() => {
+      try { setCryptoEnabled(hasCrypto(c)) } catch {}
+    }, 500)
   }
 
   // ---------- login flows ----------
