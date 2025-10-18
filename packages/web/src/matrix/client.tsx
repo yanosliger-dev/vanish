@@ -32,10 +32,10 @@ type MatrixCtx = {
   importRoomKeysFromFile(file: File): Promise<void>
   exportRoomKeysToFile(filename?: string): Promise<void>
 
-  // NEW: E2EE helpers
+  // E2EE helpers
   ensureRoomEncrypted(roomId: string): Promise<void>
-  createEncryptedRoom(name?: string): Promise<string> // returns roomId
-  createEncryptedDM(userId: string): Promise<string>  // returns roomId
+  createEncryptedRoom(name?: string): Promise<string>
+  createEncryptedDM(userId: string): Promise<string>
 
   cryptoEnabled: boolean
   keyBackupEnabled: boolean
@@ -79,41 +79,45 @@ function hasCrypto(c: MatrixClient): boolean {
   return !!(anyC.getCrypto?.() || anyC.crypto || anyC.isCryptoEnabled?.())
 }
 
-/** Try Rust crypto (WASM), else fall back to legacy OLM asm.js (no WASM). */
-async function ensureCrypto(client: MatrixClient): Promise<boolean> {
-  if (hasCrypto(client)) return true
-
-  // Prefer Rust WASM
+/** Try to ensure the SDK crypto layer is up. */
+export async function ensureCrypto(client: any): Promise<boolean> {
   try {
-    await import('@matrix-org/matrix-sdk-crypto-wasm')
-    if ((client as any).initRustCrypto) {
-      await (client as any).initRustCrypto()
-      if (hasCrypto(client)) return true
+    if (client.getCrypto && client.getCrypto()) {
+      console.log('[Vanish] Crypto already active.')
+      return true
     }
-  } catch {/* ignore */}
 
-  // Fallback: legacy OLM (asm.js) – no WASM MIME required
-  try {
-    await import('@matrix-org/olm/olm_legacy.js')
-    const Olm = (window as any).Olm
-    if (Olm?.init) await Olm.init()
-    ;(window as any).Olm = Olm
-    if ((client as any).initCrypto) {
-      await (client as any).initCrypto()
-      if (hasCrypto(client)) return true
+    if (client.initCrypto) {
+      console.log('[Vanish] Initialising crypto…')
+      await client.initCrypto()
     }
-  } catch (e) {
-    console.warn('[Matrix] Failed to start legacy OLM crypto', e)
+
+    if (client.startClient) {
+      console.log('[Vanish] Starting client with crypto…')
+      await client.startClient({ initialSyncLimit: 20 })
+    }
+
+    if (client.getCrypto && !client.getCrypto()) {
+      console.warn('[Vanish] Crypto still null after init, waiting for sync…')
+      await new Promise((res) => setTimeout(res, 3000))
+    }
+
+    const cryptoReady = !!client.getCrypto()
+    console.log('[Vanish] ensureCrypto() →', cryptoReady)
+    return cryptoReady
+  } catch (err) {
+    console.error('[Vanish] ensureCrypto failed', err)
+    return false
   }
-
-  return hasCrypto(client)
 }
 
 /* -------------- provider/hook -------------- */
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
+  // Early load crypto engine (Rust → OLM fallback) before we even build a client
   useEffect(() => {
     initCryptoEarly().catch((err) => console.error('Crypto early init failed', err))
   }, [])
+
   const [client, setClient] = useState<MatrixClient | null>(null)
   const [ready, setReady]   = useState(false)
   const [syncing, setSyncing] = useState(false)
@@ -179,7 +183,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable; using memory stores.', e)
     }
 
-    // Try to enable crypto now (OK if it fails — handlers will init on demand)
+    // Try to enable crypto now (OK if it fails — helpers will try again on demand)
     const enabled = await ensureCrypto(c)
     setCryptoEnabled(enabled)
 
@@ -193,17 +197,39 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }
 
   // ---------- login flows ----------
-  async function initPasswordLogin({ homeserver, user, pass }:{
-    homeserver:string; user:string; pass:string
+  async function initPasswordLogin({ homeserver, user, pass }: {
+    homeserver: string
+    user: string
+    pass: string
   }) {
     const hs = normHs(homeserver)
     const temp = createClient({ baseUrl: hs })
-    const raw  = await temp.login('m.login.password', { user, password: pass }) as RawLoginResult
-    const res  = normalizeLoginResult(raw)
+    const raw = await temp.login('m.login.password', { user, password: pass }) as RawLoginResult
+    const res = normalizeLoginResult(raw)
+
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }))
-    const c = createClient({ baseUrl: hs, userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId })
-    setHomeserver(hs); setClient(c); await start(c)
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      userId: res.userId,
+      accessToken: res.accessToken,
+      deviceId: res.deviceId
+    }))
+
+    const c = createClient({
+      baseUrl: hs,
+      userId: res.userId,
+      accessToken: res.accessToken,
+      deviceId: res.deviceId
+    })
+
+    setHomeserver(hs)
+    setClient(c)
+
+    // Kick crypto immediately after we have a client
+    ensureCrypto(c)
+      .then((ok) => { console.log('[Vanish] Post-login crypto init →', ok); setCryptoEnabled(ok) })
+      .catch((e) => console.warn('[Vanish] ensureCrypto right-after-login failed', e))
+
+    await start(c)
   }
 
   async function finishSsoLoginWithToken({ homeserver, token }:{
@@ -213,10 +239,23 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     const temp = createClient({ baseUrl: hs })
     const raw  = await temp.loginWithToken(token) as RawLoginResult
     const res  = normalizeLoginResult(raw)
+
     localStorage.setItem(HS_STORAGE_KEY, hs)
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId }))
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      userId: res.userId,
+      accessToken: res.accessToken,
+      deviceId: res.deviceId
+    }))
+
     const c = createClient({ baseUrl: hs, userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId })
-    setHomeserver(hs); setClient(c); await start(c)
+    setHomeserver(hs)
+    setClient(c)
+
+    ensureCrypto(c)
+      .then((ok) => { console.log('[Vanish] Post-SSO crypto init →', ok); setCryptoEnabled(ok) })
+      .catch((e) => console.warn('[Vanish] ensureCrypto right-after-SSO failed', e))
+
+    await start(c)
   }
 
   async function startWithAccessToken({ homeserver, userId, accessToken, deviceId }:{
@@ -227,7 +266,15 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     const c  = createClient({ baseUrl: hs, userId, accessToken, deviceId })
     localStorage.setItem(HS_STORAGE_KEY, hs)
     localStorage.setItem(SESSION_KEY, JSON.stringify({ userId, accessToken, deviceId }))
-    setHomeserver(hs); setClient(c); await start(c)
+
+    setHomeserver(hs)
+    setClient(c)
+
+    ensureCrypto(c)
+      .then((ok) => { console.log('[Vanish] Post-token crypto init →', ok); setCryptoEnabled(ok) })
+      .catch((e) => console.warn('[Vanish] ensureCrypto right-after-token failed', e))
+
+    await start(c)
   }
 
   async function logout() {
@@ -318,8 +365,8 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     } catch (e:any) { alert('Export failed: ' + (e?.message ?? String(e))) }
   }
 
-  // ---------- NEW: E2EE going forward ----------
-  /** Ensure a room has m.room.encryption set to Megolm. Requires power level to send state. */
+  // ---------- E2EE going forward ----------
+  /** Ensure a room has m.room.encryption set to Megolm. Requires PL to send state. */
   async function ensureRoomEncrypted(roomId: string) {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
@@ -329,11 +376,9 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
     if (room.isEncrypted && room.isEncrypted()) return
 
-    // prefer helper if present
     if ((client as any).setRoomEncryption) {
       await (client as any).setRoomEncryption(roomId, { algorithm: 'm.megolm.v1.aes-sha2' })
     } else {
-      // send state manually
       await client.sendStateEvent(roomId, 'm.room.encryption', { algorithm: 'm.megolm.v1.aes-sha2' }, '')
     }
   }
@@ -376,8 +421,12 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       const s = JSON.parse(raw)
       if (!nonEmpty(s.userId) || !nonEmpty(s.accessToken)) { localStorage.removeItem(SESSION_KEY); return }
       const c = createClient({ baseUrl: hs, userId: s.userId, accessToken: s.accessToken, deviceId: s.deviceId })
-      setHomeserver(hs); setClient(c); start(c)
-    } catch { localStorage.removeItem(SESSION_KEY) }
+      setHomeserver(hs)
+      setClient(c)
+      start(c)
+    } catch {
+      localStorage.removeItem(SESSION_KEY)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
