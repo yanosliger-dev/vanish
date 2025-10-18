@@ -124,6 +124,17 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   const startedRef = useRef(false)
 
+  // If a client is present, ensure crypto is started and update the badge.
+  useEffect(() => {
+    if (!client) return
+    let cancelled = false
+    ;(async () => {
+      const ok = await ensureCrypto(client)
+      if (!cancelled) setCryptoEnabled(ok)
+    })().catch((e) => console.warn('[Vanish] ensureCrypto on client mount failed', e))
+    return () => { cancelled = true }
+  }, [client])
+
   function bindClient(c: MatrixClient) {
     const refresh = () => setRooms(sortRooms(roomsArray(c)) as Room[])
 
