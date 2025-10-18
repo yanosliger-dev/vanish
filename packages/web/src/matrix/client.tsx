@@ -27,12 +27,10 @@ type MatrixCtx = {
   startWithAccessToken(args:{ homeserver:string; userId:string; accessToken:string; deviceId?:string }): Promise<void>
   logout(): Promise<void>
 
-  // history + crypto tools (optional)
   paginateBack(roomId: string, batches?: number, limitPerBatch?: number): Promise<number>
   importRoomKeysFromFile(file: File): Promise<void>
   exportRoomKeysToFile(filename?: string): Promise<void>
 
-  // E2EE helpers
   ensureRoomEncrypted(roomId: string): Promise<void>
   createEncryptedRoom(name?: string): Promise<string>
   createEncryptedDM(userId: string): Promise<string>
@@ -72,14 +70,12 @@ const lastTs = (r:any) => {
 const sortRooms = (rs:any[]) => [...rs].sort((a,b)=>lastTs(b)-lastTs(a))
 
 /* --------------- crypto init --------------- */
-
-// True if any “crypto exists” signal is present on this SDK build
 function hasCrypto(c: MatrixClient): boolean {
   const anyC: any = c as any
   return !!(anyC.getCrypto?.() || anyC.crypto || anyC.isCryptoEnabled?.())
 }
 
-/** Try to ensure the SDK crypto layer is up. */
+/** Initialise the SDK crypto layer (Rust if available; else legacy OLM). DOES NOT start the client. */
 export async function ensureCrypto(client: any): Promise<boolean> {
   try {
     if (client.getCrypto && client.getCrypto()) {
@@ -87,24 +83,36 @@ export async function ensureCrypto(client: any): Promise<boolean> {
       return true
     }
 
-    if (client.initCrypto) {
-      console.log('[Vanish] Initialising crypto…')
-      await client.initCrypto()
+    // Prefer Rust crypto if this build exposes it
+    if (typeof client.initRustCrypto === 'function') {
+      try {
+        await import('@matrix-org/matrix-sdk-crypto-wasm')
+        console.log('[Vanish] Initialising Rust crypto…')
+        await client.initRustCrypto()
+        return !!client.getCrypto?.()
+      } catch (e) {
+        console.warn('[Vanish] Rust crypto unavailable, falling back to legacy OLM.', e)
+      }
     }
 
-    if (client.startClient) {
-      console.log('[Vanish] Starting client with crypto…')
-      await client.startClient({ initialSyncLimit: 20 })
+    // Legacy OLM (asm.js)
+    try {
+      if (!(window as any).Olm) {
+        await import('@matrix-org/olm/olm_legacy.js')
+        const Olm = (window as any).Olm
+        if (Olm?.init) await Olm.init()
+        ;(window as any).Olm = Olm
+      }
+      if (typeof client.initCrypto === 'function') {
+        console.log('[Vanish] Initialising legacy OLM crypto…')
+        await client.initCrypto()
+      }
+    } catch (e) {
+      console.error('[Vanish] Legacy OLM init failed', e)
+      return false
     }
 
-    if (client.getCrypto && !client.getCrypto()) {
-      console.warn('[Vanish] Crypto still null after init, waiting for sync…')
-      await new Promise((res) => setTimeout(res, 3000))
-    }
-
-    const cryptoReady = !!client.getCrypto()
-    console.log('[Vanish] ensureCrypto() →', cryptoReady)
-    return cryptoReady
+    return !!client.getCrypto?.()
   } catch (err) {
     console.error('[Vanish] ensureCrypto failed', err)
     return false
@@ -113,7 +121,7 @@ export async function ensureCrypto(client: any): Promise<boolean> {
 
 /* -------------- provider/hook -------------- */
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
-  // Early load crypto engine (Rust → OLM fallback) before we even build a client
+  // Make Olm/Rust available in the page ASAP
   useEffect(() => {
     initCryptoEarly().catch((err) => console.error('Crypto early init failed', err))
   }, [])
@@ -128,7 +136,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   const startedRef = useRef(false)
 
-  // If a client is present, ensure crypto is started and update the badge.
+  // If a client exists, we may refresh the crypto badge (safe: does not start client)
   useEffect(() => {
     if (!client) return
     let cancelled = false
@@ -172,7 +180,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (startedRef.current) return
     startedRef.current = true
 
-    // persistent stores
+    // persistent stores (must exist BEFORE crypto init)
     try {
       const { IndexedDBStore } = await import('matrix-js-sdk/lib/store/indexeddb')
       const { IndexedDBCryptoStore } = await import('matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store')
@@ -183,12 +191,13 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable; using memory stores.', e)
     }
 
-    // Try to enable crypto now (OK if it fails — helpers will try again on demand)
+    // Init crypto (but DON'T start client here)
     const enabled = await ensureCrypto(c)
     setCryptoEnabled(enabled)
 
     bindClient(c)
 
+    // Now start the client
     await c.startClient({
       initialSyncLimit: 50,
       lazyLoadMembers: true,
@@ -224,11 +233,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     setHomeserver(hs)
     setClient(c)
 
-    // Kick crypto immediately after we have a client
-    ensureCrypto(c)
-      .then((ok) => { console.log('[Vanish] Post-login crypto init →', ok); setCryptoEnabled(ok) })
-      .catch((e) => console.warn('[Vanish] ensureCrypto right-after-login failed', e))
-
     await start(c)
   }
 
@@ -251,10 +255,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     setHomeserver(hs)
     setClient(c)
 
-    ensureCrypto(c)
-      .then((ok) => { console.log('[Vanish] Post-SSO crypto init →', ok); setCryptoEnabled(ok) })
-      .catch((e) => console.warn('[Vanish] ensureCrypto right-after-SSO failed', e))
-
     await start(c)
   }
 
@@ -269,10 +269,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
     setHomeserver(hs)
     setClient(c)
-
-    ensureCrypto(c)
-      .then((ok) => { console.log('[Vanish] Post-token crypto init →', ok); setCryptoEnabled(ok) })
-      .catch((e) => console.warn('[Vanish] ensureCrypto right-after-token failed', e))
 
     await start(c)
   }
@@ -295,7 +291,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     return (client as any).getCrypto?.() || (client as any).crypto || client
   }
 
-  // ---------- history (optional) ----------
+  // ---------- history ----------
   async function paginateBack(roomId: string, batches = 10, limitPerBatch = 50): Promise<number> {
     if (!client) return 0
     const room = client.getRoom(roomId)
@@ -310,7 +306,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     return loaded
   }
 
-  // ---------- import/export (optional for recovery) ----------
+  // ---------- import/export ----------
   async function importRoomKeysFromFile(file: File) {
     if (!client) return
     const crypto = await maybeInitCrypto().catch((e)=>{ alert('Import failed: ' + (e?.message ?? String(e))); return null })
@@ -366,7 +362,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
   }
 
   // ---------- E2EE going forward ----------
-  /** Ensure a room has m.room.encryption set to Megolm. Requires PL to send state. */
   async function ensureRoomEncrypted(roomId: string) {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
@@ -383,7 +378,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  /** Create a new encrypted room (group chat). Returns roomId. */
   async function createEncryptedRoom(name?: string): Promise<string> {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
@@ -397,7 +391,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     return (res as any).room_id as string
   }
 
-  /** Create a new encrypted DM with a single user. Returns roomId. */
   async function createEncryptedDM(userId: string): Promise<string> {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
