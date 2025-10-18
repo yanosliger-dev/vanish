@@ -1,44 +1,124 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { useMatrix } from '../matrix/client'
+import type { Room } from 'matrix-js-sdk'
 
-type Props = { activeRoomId: string | null; onSelect: (roomId: string) => void }
+/** Parse active room id from hash like #/room/<roomId> (fallback: empty) */
+function getActiveFromHash(): string {
+  const m = window.location.hash.match(/#\/room\/(.+)/)
+  return m?.[1] ?? ''
+}
 
-export default function RoomList({ activeRoomId, onSelect }: Props) {
-  const { rooms, ready } = useMatrix()
-  const [q, setQ] = useState('')
+export default function RoomList() {
+  const {
+    rooms,
+    client,
+    createEncryptedDM,
+    createEncryptedRoom,
+  } = useMatrix()
 
-  const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase()
-    const base = rooms
-    if (!needle) return base
-    return base.filter(r => (r.name || r.roomId).toLowerCase().includes(needle))
-  }, [rooms, q])
+  const [query, setQuery] = useState('')
+  const [active, setActive] = useState<string>(getActiveFromHash())
+
+  // keep selection in sync with URL hash (works with RoomView implementations that read the hash)
+  useEffect(() => {
+    const onHash = () => setActive(getActiveFromHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  // First room as default if none selected
+  useEffect(() => {
+    if (!active && rooms.length) {
+      setActive(rooms[0].roomId)
+      window.location.hash = `#/room/${rooms[0].roomId}`
+    }
+  }, [active, rooms])
+
+  const filtered: Room[] = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return rooms
+    return rooms.filter(r =>
+      (r.name || '').toLowerCase().includes(q) ||
+      r.roomId.toLowerCase().includes(q)
+    )
+  }, [rooms, query])
+
+  function selectRoom(roomId: string) {
+    setActive(roomId)
+    // hash helps RoomView implementations that rely on location
+    window.location.hash = `#/room/${roomId}`
+  }
+
+  async function onNewDM() {
+    const userId = window.prompt('Start encrypted DM with user (e.g. @alice:your-hs.tld):')
+    if (!userId) return
+    if (!/^@.+:.+/.test(userId)) { alert('Please enter a valid Matrix userId, e.g. @name:server'); return }
+    try {
+      const roomId = await createEncryptedDM(userId.trim())
+      // join (defensive: createRoom already joins you, but just in case)
+      await client?.joinRoom?.(roomId).catch(()=>{})
+      selectRoom(roomId)
+    } catch (e:any) {
+      alert('Failed to create DM: ' + (e?.message ?? String(e)))
+    }
+  }
+
+  async function onNewRoom() {
+    const name = window.prompt('Encrypted room name (optional):') || undefined
+    try {
+      const roomId = await createEncryptedRoom(name)
+      await client?.joinRoom?.(roomId).catch(()=>{})
+      selectRoom(roomId)
+    } catch (e:any) {
+      alert('Failed to create room: ' + (e?.message ?? String(e)))
+    }
+  }
 
   return (
-    <div className="sidebar">
-      <div className="side-header">
-        <div className="brand">{import.meta.env.VITE_APP_NAME || 'Vanish'}</div>
+    <div className="sidebar-inner" style={{ display:'flex', flexDirection:'column', height:'100%' }}>
+      <div style={{ display:'flex', gap:8, margin:'8px 8px 6px 8px' }}>
+        <button className="btn" onClick={onNewDM} title="New encrypted DM">New chat</button>
+        <button className="btn secondary" onClick={onNewRoom} title="New encrypted room">New room</button>
       </div>
 
-      <div className="search">
-        <input className="input" placeholder="Search rooms…" value={q} onChange={e=>setQ(e.target.value)} />
-      </div>
+      <input
+        className="input"
+        style={{ margin: '0 8px 8px 8px' }}
+        placeholder="Search rooms…"
+        value={query}
+        onChange={e=>setQuery(e.target.value)}
+      />
 
-      <div className="room-list">
-        {!ready && <div className="footer-note">Syncing…</div>}
-        {ready && filtered.length === 0 && <div className="footer-note">No rooms.</div>}
+      <div style={{ overflow:'auto', padding:'0 6px 8px 6px' }}>
         {filtered.map(r => {
-          const lastTs = new Date((r as any).getLastActiveTs?.() || 0).toLocaleString()
-          const encrypted = r.isEncrypted && r.isEncrypted()
+          const isActive = r.roomId === active
           return (
-            <div key={r.roomId}
-                 className={`room ${activeRoomId === r.roomId ? 'active' : ''}`}
-                 onClick={()=>onSelect(r.roomId)} title={r.name || r.roomId}>
-              <div className="room-title">{encrypted ? '🔐 ' : ''}{r.name || r.roomId}</div>
-              <div className="room-meta"><span>{lastTs !== 'Invalid Date' ? lastTs : '—'}</span></div>
+            <div
+              key={r.roomId}
+              className="room-list-item"
+              onClick={() => selectRoom(r.roomId)}
+              style={{
+                padding:'10px 12px',
+                borderRadius:12,
+                cursor:'pointer',
+                margin:'4px 2px',
+                background: isActive ? 'rgba(255,255,255,0.06)' : 'transparent',
+                border: isActive ? '1px solid rgba(255,255,255,0.15)' : '1px solid transparent',
+              }}
+              title={r.roomId}
+            >
+              <div style={{ fontWeight:600, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                {r.name || r.roomId}
+              </div>
+              <div style={{ fontSize:12, opacity:0.6 }}>
+                {r.isEncrypted?.() ? '🔐 Encrypted' : '⚠️ Not encrypted'}
+              </div>
             </div>
           )
         })}
+        {filtered.length === 0 && (
+          <div style={{ opacity: 0.6, padding: '8px 10px' }}>No rooms</div>
+        )}
       </div>
     </div>
   )
