@@ -198,18 +198,30 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
     bindClient(c)
 
-    // Now start the client
+    // Start the client
     await c.startClient({
       initialSyncLimit: 50,
       lazyLoadMembers: true,
       timelineSupport: true,
     })
 
-    // Nudge the badge after sync ticks in legacy OLM
-    setTimeout(() => {
-      try { setCryptoEnabled(hasCrypto(c)) } catch {}
-    }, 500)
+    // 🟢 NEW: verify crypto state after sync fully begins
+    const checkCryptoReady = async (tries = 0): Promise<void> => {
+      if (hasCrypto(c)) {
+        console.log('[Vanish] Crypto fully active ✓')
+        setCryptoEnabled(true)
+        return
+      }
+      if (tries > 10) {
+        console.warn('[Vanish] Crypto check timeout — legacy OLM might be slow to report readiness')
+        return
+      }
+      await new Promise(res => setTimeout(res, 500))
+      await checkCryptoReady(tries + 1)
+    }
+    checkCryptoReady()
   }
+
 
   // ---------- login flows ----------
   async function initPasswordLogin({ homeserver, user, pass }: {
