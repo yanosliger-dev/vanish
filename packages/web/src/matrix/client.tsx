@@ -6,6 +6,7 @@ import React, {
   useRef,
   useState,
 } from 'react'
+import { initCryptoEarly } from './cryptoInit'
 import { createClient, MatrixClient, Room } from 'matrix-js-sdk'
 
 type RawLoginResult = {
@@ -110,6 +111,9 @@ async function ensureCrypto(client: MatrixClient): Promise<boolean> {
 
 /* -------------- provider/hook -------------- */
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
+  useEffect(() => {
+    initCryptoEarly().catch((err) => console.error('Crypto early init failed', err))
+  }, [])
   const [client, setClient] = useState<MatrixClient | null>(null)
   const [ready, setReady]   = useState(false)
   const [syncing, setSyncing] = useState(false)
