@@ -118,47 +118,92 @@ export default function RoomView({ activeRoomId }: Props) {
     return null
   }
 
-  // -------------------------- Encrypt room --------------------------
   async function encryptRoomNow() {
     if (!boundRoom || !client) return
     setEncrypting(true)
-    const roomId = boundRoom.roomId
 
+    const roomId = boundRoom.roomId
     try {
-      await waitForRoomReady(roomId) // <- ensure SDK knows the room
+      // 1) Make sure the client is actually joined to this room
+      let r = client.getRoom(roomId) as Room | undefined
+      if (!r || r.getMyMembership?.() !== 'join') {
+        try {
+          await client.joinRoom(roomId)
+        } catch (e) {
+          // If we were already joined, homeserver may throw: that's fine
+        }
+        r = await waitForRoomJoin(client, roomId, 10000)
+      }
+
+      // If already encrypted, nothing to do
+      if (r.isEncrypted?.()) {
+        setTimeout(() => setEvents(r!.getLiveTimeline().getEvents()), 0)
+        alert('Room is already encrypted.')
+        return
+      }
+
+      // 2) Try to set encryption using the best API available
+      const content = { algorithm: 'm.megolm.v1.aes-sha2' }
+      const trySet = async () => {
+        if (typeof (client as any).setRoomEncryption === 'function') {
+          await (client as any).setRoomEncryption(roomId, content)
+        } else {
+          await client.sendStateEvent(roomId, 'm.room.encryption', content, '')
+        }
+      }
+
       try {
-        await ensureRoomEncrypted(roomId)
+        await trySet()
       } catch (e: any) {
-        // Some homeservers/SDK timing can throw "Unknown room" right after navigation/creation.
+        // Some SDK/server combos briefly report "Unknown room" right after navigation/creation.
         if (String(e?.message || e).toLowerCase().includes('unknown room')) {
-          await new Promise(res => setTimeout(res, 400))
-          await waitForRoomReady(roomId, 4000)
-          await ensureRoomEncrypted(roomId) // retry once
+          await new Promise(res => setTimeout(res, 500))
+          r = await waitForRoomJoin(client, roomId, 5000)
+          await trySet() // retry once
         } else {
           throw e
         }
       }
 
-      // Nudge UI to flip banner ASAP
+      // 3) Force a quick UI refresh so banner flips immediately
       setTimeout(() => {
-        const r = client.getRoom(roomId)
-        if (r) setEvents(r.getLiveTimeline().getEvents())
-      }, 200)
+        const rr = client.getRoom(roomId) as Room | undefined
+        if (rr) setEvents(rr.getLiveTimeline().getEvents())
+      }, 150)
 
       alert('Room encryption enabled. New messages will be end-to-end encrypted.')
     } catch (e: any) {
-      alert('Failed to enable encryption: ' + (e?.message ?? String(e)))
+      // Helpful diagnostics for common causes
+      const msg = e?.message ?? String(e)
+      if (/power/i.test(msg)) {
+        alert('Failed to enable encryption: insufficient power level to send room state.')
+      } else {
+        alert('Failed to enable encryption: ' + msg)
+      }
     } finally {
       setEncrypting(false)
     }
   }
 
-  // -------------------------- Send message --------------------------
+
+  /** Wait until SDK really knows this room and we are joined */
+  async function waitForRoomJoin(client: any, roomId: string, timeoutMs = 10000) {
+    const step = 250
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      const r = client.getRoom(roomId)
+      if (r?.getMyMembership?.() === 'join') return r as Room
+      await new Promise(res => setTimeout(res, step))
+    }
+    throw new Error('timeout waiting for join')
+  }
+
   async function sendMessage() {
     if (!client || !boundRoom) return
     const roomId = boundRoom.roomId
 
-    await waitForRoomReady(roomId)
+    // Ensure joined/ready first
+    try { await waitForRoomJoin(client, roomId, 8000) } catch {}
 
     if (!boundRoom.isEncrypted?.() && !confirm('This room is not encrypted. Encrypt it now?')) {
       return
@@ -172,10 +217,11 @@ export default function RoomView({ activeRoomId }: Props) {
     if (!body) return
     setSending(true)
     try {
-      await client.sendEvent(roomId, 'm.room.message', { msgtype:'m.text', body })
+      await client.sendEvent(roomId, 'm.room.message', { msgtype: 'm.text', body })
       if (inputRef.current) inputRef.current.value = ''
     } finally { setSending(false) }
   }
+
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
