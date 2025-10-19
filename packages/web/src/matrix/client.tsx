@@ -70,9 +70,12 @@ const lastTs = (r:any) => {
 const sortRooms = (rs:any[]) => [...rs].sort((a,b)=>lastTs(b)-lastTs(a))
 
 /* --------------- crypto init --------------- */
+/** Treat Rust, legacy SDK crypto, or Olm loaded in the page as “crypto available”. */
 function hasCrypto(c: MatrixClient): boolean {
   const anyC: any = c as any
-  return !!(anyC.getCrypto?.() || anyC.crypto || anyC.isCryptoEnabled?.())
+  const sdkHas = !!(anyC.getCrypto?.() || anyC.crypto || anyC.isCryptoEnabled?.())
+  const olmLoaded = typeof (window as any).Olm !== 'undefined'
+  return sdkHas || olmLoaded
 }
 
 /** Initialise the SDK crypto layer (Rust if available; else legacy OLM). DOES NOT start the client. */
@@ -112,7 +115,7 @@ export async function ensureCrypto(client: any): Promise<boolean> {
       return false
     }
 
-    // ✅ Use hasCrypto so both Rust + legacy paths are recognised
+    // ✅ recognise legacy path too
     return hasCrypto(client)
   } catch (err) {
     console.error('[Vanish] ensureCrypto failed', err)
@@ -194,25 +197,25 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
     // Init crypto (but DON'T start client here)
     const enabled = await ensureCrypto(c)
-    setCryptoEnabled(enabled)
+    setCryptoEnabled(enabled || typeof (window as any).Olm !== 'undefined')
 
     bindClient(c)
 
-    // Start the client
+    // Now start the client
     await c.startClient({
       initialSyncLimit: 50,
       lazyLoadMembers: true,
       timelineSupport: true,
     })
 
-    // 🟢 NEW: verify crypto state after sync fully begins
+    // Verify crypto becomes visible to the SDK after sync begins (legacy OLM quirk)
     const checkCryptoReady = async (tries = 0): Promise<void> => {
       if (hasCrypto(c)) {
         console.log('[Vanish] Crypto fully active ✓')
         setCryptoEnabled(true)
         return
       }
-      if (tries > 10) {
+      if (tries > 10) { // ~5s max
         console.warn('[Vanish] Crypto check timeout — legacy OLM might be slow to report readiness')
         return
       }
@@ -221,7 +224,6 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     }
     checkCryptoReady()
   }
-
 
   // ---------- login flows ----------
   async function initPasswordLogin({ homeserver, user, pass }: {
@@ -303,7 +305,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (!client) throw new Error('No client')
     if (!hasCrypto(client)) {
       const ok = await ensureCrypto(client)
-      setCryptoEnabled(ok)
+      setCryptoEnabled(ok || typeof (window as any).Olm !== 'undefined')
     }
     if (!hasCrypto(client)) throw new Error('Crypto not initialised')
     return (client as any).getCrypto?.() || (client as any).crypto || client
