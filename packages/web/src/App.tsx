@@ -1,61 +1,50 @@
-import React, { useEffect, useMemo, useState } from 'react'
+// src/App.tsx
+import React, { useEffect, useState } from 'react'
 import Login from './components/Login'
 import RoomList from './components/RoomList'
 import RoomView from './components/RoomView'
 import { MatrixProvider } from './matrix/client'
-import { useMatrix } from './matrix/client'
 
-function useActiveRoomIdFromHash(roomsReady: boolean) {
-  const [activeRoomId, setActiveRoomId] = useState<string | null>(null)
-
-  // Parse #/room/<roomId>
-  const parseHash = () => {
-    const h = location.hash || ''
-    const part = decodeURIComponent((h.split('/room/')[1] || '').split(/[?#]/)[0] || '')
-    setActiveRoomId(part || null)
-  }
-
-  useEffect(() => {
-    parseHash()
-    const onHash = () => parseHash()
-    window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // If we don't have a room in the hash when rooms are ready, keep it null.
-  // RoomList will highlight none; the user can click one.
-  useEffect(() => {
-    if (roomsReady && !location.hash.includes('/room/')) {
-      // leave as null; clicking a room will set the hash
-    }
-  }, [roomsReady])
-
-  return [activeRoomId, setActiveRoomId] as const
+function hasSession() {
+  // Primary (our provider):
+  if (localStorage.getItem('vanish.session')) return true
+  // Fallback (older logic):
+  if (localStorage.getItem('mx_access_token')) return true
+  return false
 }
 
 function Shell() {
-  const [loggedIn, setLoggedIn] = useState(
-    Boolean(localStorage.getItem('mx_access_token')) // your original gate
-  )
-  const onLoggedIn = () => setLoggedIn(true)
+  // Parse #/room/<roomId> and pass to RoomView
+  const parseHash = () => {
+    const m = window.location.hash.match(/#\/room\/([^?#]+)/)
+    return m?.[1] ? decodeURIComponent(m[1]) : null
+  }
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(parseHash())
 
-  // We need ready flag to know when rooms list is populated
-  const { ready } = useMatrix()
-  const [activeRoomId] = useActiveRoomIdFromHash(ready)
+  useEffect(() => {
+    const onHash = () => setActiveRoomId(parseHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
 
   return (
     <div className="app">
-      <aside className="sidebar"><RoomList activeRoomId={activeRoomId} /></aside>
+      <aside className="sidebar"><RoomList /></aside>
       <main className="main"><RoomView activeRoomId={activeRoomId} /></main>
     </div>
   )
 }
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(
-    Boolean(localStorage.getItem('mx_access_token'))
-  )
+  const [loggedIn, setLoggedIn] = useState<boolean>(hasSession())
+
+  // Keep gate in sync if another tab logs in/out or after Login writes storage
+  useEffect(() => {
+    const onStorage = () => setLoggedIn(hasSession())
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
   const onLoggedIn = () => setLoggedIn(true)
 
   return (
