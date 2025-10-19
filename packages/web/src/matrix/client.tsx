@@ -108,30 +108,15 @@ function hasCrypto(c: MatrixClient): boolean {
 export async function ensureCrypto(client: any): Promise<boolean> {
   try {
     if (client.getCrypto && client.getCrypto()) {
-      console.log('[Vanish] Crypto already active')
       return true
     }
-
-    if (client.initCrypto) {
-      console.log('[Vanish] Initialising crypto…')
-      await client.initCrypto()
-    }
-
-    if (client.startClient) {
-      // If not started yet, start — safe to call redundantly
-      console.log('[Vanish] Starting client (crypto)…')
-      await client.startClient({ initialSyncLimit: 20 })
-    }
-
+    if (client.initCrypto) await client.initCrypto()
+    if (client.startClient) await client.startClient({ initialSyncLimit: 20 })
     if (client.getCrypto && !client.getCrypto()) {
-      console.warn('[Vanish] Crypto still null after init, waiting…')
       await new Promise(res => setTimeout(res, 2000))
     }
-    const ok = !!client.getCrypto?.()
-    console.log('[Vanish] ensureCrypto →', ok)
-    return ok
-  } catch (err) {
-    console.error('[Vanish] ensureCrypto failed', err)
+    return !!client.getCrypto?.()
+  } catch {
     return false
   }
 }
@@ -139,7 +124,7 @@ export async function ensureCrypto(client: any): Promise<boolean> {
 /* -------------- provider/hook -------------- */
 
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
-  // Try to prep WASM early (if available)
+  // prep WASM early if present
   useEffect(() => {
     initCryptoEarly().catch(err => console.error('Crypto early init failed', err))
   }, [])
@@ -154,7 +139,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   const startedRef = useRef(false)
 
-  // If a client exists, try to start crypto and keep badge updated
+  // keep crypto badge up to date whenever client appears
   useEffect(() => {
     if (!client) return
     let cancelled = false
@@ -172,7 +157,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       if (roomsArray(c).length > 0) setReady(true)
     }
 
-    // Refresh frequently — any of these mean our room list may change
+    // Room list refreshers
     c.on('Room', () => { refresh(); markReadyIfRooms() })
     c.on('Room.timeline', () => { refresh() })
     c.on('Room.name', refresh)
@@ -180,6 +165,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     c.on('deleteRoom', refresh)
     c.on('Room.receipt', refresh)
 
+    // Sync lifecycle → decide "ready"
     c.on('sync', async (state: string) => {
       if (state === 'PREPARED') {
         setReady(true)
@@ -190,10 +176,10 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       }
       setSyncing(state === 'SYNCING' || state === 'CATCHUP')
 
-      // Update crypto/key-backup flags when we know crypto exists
+      // Update crypto/backup flags opportunistically
       try {
         const has = hasCrypto(c)
-        if (has !== cryptoEnabled) setCryptoEnabled(has)
+        setCryptoEnabled(has)
         if (has && (c as any).isKeyBackupEnabled) {
           const kb = await (c as any).isKeyBackupEnabled()
           setKeyBackupEnabled(!!kb)
@@ -202,7 +188,45 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     })
   }
 
-  /* ---------- start client w/ stores + fallback ready nudge ---------- */
+  /* ---------- wait helpers (defensive) ---------- */
+  function wait(ms: number) { return new Promise(res => setTimeout(res, ms)) }
+
+  /** Resolve true when any rooms appear OR PREPARED fires; false on timeout. */
+  async function waitForFirstRoomsOrPrepared(c: MatrixClient, timeoutMs = 8000): Promise<boolean> {
+    const startAt = Date.now()
+    return await new Promise<boolean>((resolve) => {
+      let done = false
+      const finish = (v: boolean) => { if (!done) { done = true; cleanup(); resolve(v) } }
+
+      const check = () => {
+        if (roomsArray(c).length > 0) finish(true)
+        else if (Date.now() - startAt > timeoutMs) finish(false)
+      }
+
+      const onRoom = () => check()
+      const onSync = (state: string) => { if (state === 'PREPARED') finish(true) }
+
+      const cleanup = () => {
+        c.removeListener('Room', onRoom)
+        c.removeListener('sync', onSync as any)
+      }
+
+      c.on('Room', onRoom)
+      c.on('sync', onSync as any)
+
+      // poll lightly while we wait
+      const poll = async () => {
+        while (!done) {
+          check()
+          if (done) break
+          await wait(300)
+        }
+      }
+      poll()
+    })
+  }
+
+  /* ---------- start client w/ stores + fallback ready nudges ---------- */
   async function start(c: MatrixClient) {
     const token = (c as any).getAccessToken?.() ?? (c as any).accessToken
     if (!nonEmpty(token)) {
@@ -212,7 +236,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     if (startedRef.current) return
     startedRef.current = true
 
-    // Persistent stores (best effort)
+    // persistent stores (best effort)
     try {
       const { IndexedDBStore } = await import('matrix-js-sdk/lib/store/indexeddb')
       const { IndexedDBCryptoStore } = await import('matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store')
@@ -223,7 +247,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable; using memory stores.', e)
     }
 
-    // Try to enable crypto immediately (ok if it fails — events will init)
+    // Try crypto now (ok if it falls back)
     const enabled = await ensureCrypto(c)
     setCryptoEnabled(enabled)
 
@@ -235,14 +259,23 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       timelineSupport: true,
     })
 
-    // Fallback nudge: if rooms exist but PREPARED didn't fire, flip ready anyway
+    // Strong readiness: wait a bit for either rooms or PREPARED
+    const gotRooms = await waitForFirstRoomsOrPrepared(c, 8000)
+    if (gotRooms) {
+      setReady(true)
+      setRooms(sortRooms(roomsArray(c)) as Room[])
+    } else {
+      // even with 0 rooms, stop showing "Syncing…"
+      setReady(true)
+      setRooms(sortRooms(roomsArray(c)) as Room[])
+    }
+
+    // final nudge after a few seconds (covers odd servers)
     setTimeout(() => {
       try {
-        const anyRooms = roomsArray(c).length > 0
-        if (anyRooms) {
-          setReady(true)
-          setRooms(sortRooms(roomsArray(c)) as Room[])
-        }
+        const arr = roomsArray(c)
+        setRooms(sortRooms(arr) as Room[])
+        if (arr.length > 0) setReady(true)
       } catch {}
     }, 3000)
   }
@@ -273,11 +306,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     setHomeserver(hs)
     setClient(c)
 
-    // Kick crypto quickly after login
-    ensureCrypto(c)
-      .then(ok => { setCryptoEnabled(ok) })
-      .catch(e => console.warn('[Vanish] post-login ensureCrypto failed', e))
-
+    ensureCrypto(c).then(ok => setCryptoEnabled(ok)).catch(()=>{})
     await start(c)
   }
 
