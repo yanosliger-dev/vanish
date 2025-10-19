@@ -6,9 +6,9 @@ import RoomView from './components/RoomView'
 import { MatrixProvider } from './matrix/client'
 
 function hasSession() {
-  // Primary (our provider):
+  // Primary key used by MatrixProvider
   if (localStorage.getItem('vanish.session')) return true
-  // Fallback (older logic):
+  // Fallback for older code / migrations
   if (localStorage.getItem('mx_access_token')) return true
   return false
 }
@@ -38,7 +38,7 @@ function Shell() {
 export default function App() {
   const [loggedIn, setLoggedIn] = useState<boolean>(hasSession())
 
-  // Keep gate in sync if another tab logs in/out or after Login writes storage
+  // Stay in sync if login/logout happens in another tab
   useEffect(() => {
     const onStorage = () => setLoggedIn(hasSession())
     window.addEventListener('storage', onStorage)
@@ -53,4 +53,3 @@ export default function App() {
     </MatrixProvider>
   )
 }
-

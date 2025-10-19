@@ -140,16 +140,30 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   const startedRef = useRef(false)
 
-  // If a client exists, refresh the crypto badge (safe: does not start client)
   useEffect(() => {
-    if (!client) return
-    let cancelled = false
-    ;(async () => {
-      const ok = await ensureCrypto(client)
-      if (!cancelled) setCryptoEnabled(ok)
-    })().catch((e) => console.warn('[Vanish] ensureCrypto on client mount failed', e))
-    return () => { cancelled = true }
-  }, [client])
+    const hs = (localStorage.getItem('vanish.homeserver') || '').trim()
+    const raw = localStorage.getItem('vanish.session')
+    if (!hs || !raw) return
+    try {
+      const s = JSON.parse(raw)
+      if (!s?.userId || !s?.accessToken) {
+        localStorage.removeItem('vanish.session')
+        return
+      }
+      const c = createClient({
+        baseUrl: hs,
+        userId: s.userId,
+        accessToken: s.accessToken,
+        deviceId: s.deviceId,
+      })
+      setHomeserver(hs)
+      setClient(c)
+      start(c)   // <- starts sync; don't remove this
+    } catch {
+      localStorage.removeItem('vanish.session')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   function bindClient(c: MatrixClient) {
     const refresh = () => setRooms(sortRooms(roomsArray(c)) as Room[])
