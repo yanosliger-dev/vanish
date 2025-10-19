@@ -6,14 +6,26 @@ import React, {
   useRef,
   useState,
 } from 'react'
-import { initCryptoEarly } from './cryptoInit'
 import { createClient, MatrixClient, Room } from 'matrix-js-sdk'
+import { initCryptoEarly } from './cryptoInit'
+
+/* ---------------- types ---------------- */
 
 type RawLoginResult = {
-  access_token?: string; user_id?: string; device_id?: string; well_known?: any
-  accessToken?: string; userId?: string; deviceId?: string
+  access_token?: string
+  user_id?: string
+  device_id?: string
+  well_known?: any
+  accessToken?: string
+  userId?: string
+  deviceId?: string
 }
-type LoginResult = { accessToken: string; userId: string; deviceId?: string; wellKnown?: any }
+type LoginResult = {
+  accessToken: string
+  userId: string
+  deviceId?: string
+  wellKnown?: any
+}
 
 type MatrixCtx = {
   client: MatrixClient | null
@@ -22,9 +34,9 @@ type MatrixCtx = {
   rooms: Room[]
   homeserver: string | null
 
-  initPasswordLogin(args:{ homeserver:string; user:string; pass:string }): Promise<void>
-  finishSsoLoginWithToken(args:{ homeserver:string; token:string }): Promise<void>
-  startWithAccessToken(args:{ homeserver:string; userId:string; accessToken:string; deviceId?:string }): Promise<void>
+  initPasswordLogin(args: { homeserver: string; user: string; pass: string }): Promise<void>
+  finishSsoLoginWithToken(args: { homeserver: string; token: string }): Promise<void>
+  startWithAccessToken(args: { homeserver: string; userId: string; accessToken: string; deviceId?: string }): Promise<void>
   logout(): Promise<void>
 
   paginateBack(roomId: string, batches?: number, limitPerBatch?: number): Promise<number>
@@ -39,84 +51,85 @@ type MatrixCtx = {
   keyBackupEnabled: boolean
 }
 
+/* -------------- storage keys -------------- */
+
 const HS_STORAGE_KEY = 'vanish.homeserver'
 const SESSION_KEY   = 'vanish.session'
 
+/* ----------------- context ---------------- */
+
 const Ctx = createContext<MatrixCtx | null>(null)
 
-/* ----------------- helpers ----------------- */
-const nonEmpty = (x:any): x is string => typeof x === 'string' && x.length>0
-const normHs = (s:string) => s && /^https?:\/\//i.test(s) ? s.trim() : (s ? `https://${s.trim()}` : '')
+/* ----------------- helpers ---------------- */
+
+const nonEmpty = (x: any): x is string => typeof x === 'string' && x.length > 0
+const normHs = (s: string) =>
+  s && /^https?:\/\//i.test(s) ? s.trim() : (s ? `https://${s.trim()}` : '')
 
 function normalizeLoginResult(raw: RawLoginResult): LoginResult {
   const userId      = raw.userId      ?? raw.user_id
   const accessToken = raw.accessToken ?? raw.access_token
   const deviceId    = raw.deviceId    ?? raw.device_id
-  if (!nonEmpty(userId) || !nonEmpty(accessToken)) throw new Error('SSO login failed: missing credentials')
+  if (!nonEmpty(userId) || !nonEmpty(accessToken)) {
+    throw new Error('SSO/login failed: missing credentials')
+  }
   return { userId, accessToken, deviceId, wellKnown: raw.well_known }
 }
-function roomsArray(c:any): any[] {
-  const rs = typeof c.getVisibleRooms==='function' ? c.getVisibleRooms() : c.getRooms?.() || []
-  return Array.isArray(rs) ? rs.filter(Boolean) : []
-}
-const lastTs = (r:any) => {
+
+function roomsArray(c: any): any[] {
   try {
-    if (r?.getLastActiveTs) { const t=r.getLastActiveTs(); return Number.isFinite(t)?t:0 }
-    const ev = r?.timeline?.[r.timeline.length-1]
+    const rs = typeof c.getVisibleRooms === 'function'
+      ? c.getVisibleRooms()
+      : (typeof c.getRooms === 'function' ? c.getRooms() : [])
+    return Array.isArray(rs) ? rs.filter(Boolean) : []
+  } catch {
+    return []
+  }
+}
+const lastTs = (r: any) => {
+  try {
+    if (r?.getLastActiveTs) {
+      const t = r.getLastActiveTs()
+      return Number.isFinite(t) ? t : 0
+    }
+    const ev = r?.timeline?.[r.timeline.length - 1]
     const t = ev?.getTs?.() ?? ev?.event?.origin_server_ts
     return Number.isFinite(t) ? t : 0
   } catch { return 0 }
 }
-const sortRooms = (rs:any[]) => [...rs].sort((a,b)=>lastTs(b)-lastTs(a))
+const sortRooms = (rs: any[]) => [...rs].sort((a, b) => lastTs(b) - lastTs(a))
 
-/* --------------- crypto init --------------- */
-/** Treat Rust, legacy SDK crypto, or Olm loaded in the page as “crypto available”. */
 function hasCrypto(c: MatrixClient): boolean {
   const anyC: any = c as any
-  const sdkHas = !!(anyC.getCrypto?.() || anyC.crypto || anyC.isCryptoEnabled?.())
-  const olmLoaded = typeof (window as any).Olm !== 'undefined'
-  return sdkHas || olmLoaded
+  return !!(anyC.getCrypto?.() || anyC.crypto || anyC.isCryptoEnabled?.())
 }
 
-/** Initialise the SDK crypto layer (Rust if available; else legacy OLM). DOES NOT start the client. */
+/** Try Rust (WASM) then legacy OLM; tolerate environments without WASM. */
 export async function ensureCrypto(client: any): Promise<boolean> {
   try {
-    if (hasCrypto(client)) {
-      console.log('[Vanish] Crypto already active.')
+    if (client.getCrypto && client.getCrypto()) {
+      console.log('[Vanish] Crypto already active')
       return true
     }
 
-    // Prefer Rust crypto if exposed by this build
-    if (typeof client.initRustCrypto === 'function') {
-      try {
-        await import('@matrix-org/matrix-sdk-crypto-wasm')
-        console.log('[Vanish] Initialising Rust crypto…')
-        await client.initRustCrypto()
-        return hasCrypto(client)
-      } catch (e) {
-        console.warn('[Vanish] Rust crypto unavailable, falling back to legacy OLM.', e)
-      }
+    if (client.initCrypto) {
+      console.log('[Vanish] Initialising crypto…')
+      await client.initCrypto()
     }
 
-    // Legacy OLM (asm.js)
-    try {
-      if (!(window as any).Olm) {
-        await import('@matrix-org/olm/olm_legacy.js')
-        const Olm = (window as any).Olm
-        if (Olm?.init) await Olm.init()
-        ;(window as any).Olm = Olm
-      }
-      if (typeof client.initCrypto === 'function') {
-        console.log('[Vanish] Initialising legacy OLM crypto…')
-        await client.initCrypto()
-      }
-    } catch (e) {
-      console.error('[Vanish] Legacy OLM init failed', e)
-      return false
+    if (client.startClient) {
+      // If not started yet, start — safe to call redundantly
+      console.log('[Vanish] Starting client (crypto)…')
+      await client.startClient({ initialSyncLimit: 20 })
     }
 
-    // ✅ recognise legacy path too
-    return hasCrypto(client)
+    if (client.getCrypto && !client.getCrypto()) {
+      console.warn('[Vanish] Crypto still null after init, waiting…')
+      await new Promise(res => setTimeout(res, 2000))
+    }
+    const ok = !!client.getCrypto?.()
+    console.log('[Vanish] ensureCrypto →', ok)
+    return ok
   } catch (err) {
     console.error('[Vanish] ensureCrypto failed', err)
     return false
@@ -124,81 +137,82 @@ export async function ensureCrypto(client: any): Promise<boolean> {
 }
 
 /* -------------- provider/hook -------------- */
+
 export function MatrixProvider({ children }: { children: React.ReactNode }) {
-  // Make Olm/Rust available in the page ASAP
+  // Try to prep WASM early (if available)
   useEffect(() => {
-    initCryptoEarly().catch((err) => console.error('Crypto early init failed', err))
+    initCryptoEarly().catch(err => console.error('Crypto early init failed', err))
   }, [])
 
   const [client, setClient] = useState<MatrixClient | null>(null)
-  const [ready, setReady]   = useState(false)
+  const [ready, setReady] = useState(false)
   const [syncing, setSyncing] = useState(false)
-  const [rooms, setRooms]   = useState<Room[]>([])
+  const [rooms, setRooms] = useState<Room[]>([])
   const [homeserver, setHomeserver] = useState<string | null>(null)
   const [cryptoEnabled, setCryptoEnabled] = useState(false)
   const [keyBackupEnabled, setKeyBackupEnabled] = useState(false)
 
   const startedRef = useRef(false)
 
+  // If a client exists, try to start crypto and keep badge updated
   useEffect(() => {
-    const hs = (localStorage.getItem('vanish.homeserver') || '').trim()
-    const raw = localStorage.getItem('vanish.session')
-    if (!hs || !raw) return
-    try {
-      const s = JSON.parse(raw)
-      if (!s?.userId || !s?.accessToken) {
-        localStorage.removeItem('vanish.session')
-        return
-      }
-      const c = createClient({
-        baseUrl: hs,
-        userId: s.userId,
-        accessToken: s.accessToken,
-        deviceId: s.deviceId,
-      })
-      setHomeserver(hs)
-      setClient(c)
-      start(c)   // <- starts sync; don't remove this
-    } catch {
-      localStorage.removeItem('vanish.session')
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    if (!client) return
+    let cancelled = false
+    ;(async () => {
+      const ok = await ensureCrypto(client)
+      if (!cancelled) setCryptoEnabled(ok)
+    })().catch(e => console.warn('[Vanish] ensureCrypto on client mount failed', e))
+    return () => { cancelled = true }
+  }, [client])
 
+  /* ---------- bind client & sync/rooms handling ---------- */
   function bindClient(c: MatrixClient) {
     const refresh = () => setRooms(sortRooms(roomsArray(c)) as Room[])
+    const markReadyIfRooms = () => {
+      if (roomsArray(c).length > 0) setReady(true)
+    }
 
-    c.on('Room', refresh)
-    c.on('Room.timeline', refresh)
+    // Refresh frequently — any of these mean our room list may change
+    c.on('Room', () => { refresh(); markReadyIfRooms() })
+    c.on('Room.timeline', () => { refresh() })
     c.on('Room.name', refresh)
     c.on('Room.accountData', refresh)
     c.on('deleteRoom', refresh)
     c.on('Room.receipt', refresh)
 
-    c.on('sync', async (state) => {
+    c.on('sync', async (state: string) => {
       if (state === 'PREPARED') {
         setReady(true)
         refresh()
-        try {
-          const has = hasCrypto(c)
-          setCryptoEnabled(has)
-          if (has && (c as any).isKeyBackupEnabled) {
-            const kb = await (c as any).isKeyBackupEnabled()
-            setKeyBackupEnabled(!!kb)
-          }
-        } catch {}
+      }
+      if ((state === 'SYNCING' || state === 'CATCHUP') && roomsArray(c).length > 0) {
+        setReady(true)
       }
       setSyncing(state === 'SYNCING' || state === 'CATCHUP')
+
+      // Update crypto/key-backup flags when we know crypto exists
+      try {
+        const has = hasCrypto(c)
+        if (has !== cryptoEnabled) setCryptoEnabled(has)
+        if (has && (c as any).isKeyBackupEnabled) {
+          const kb = await (c as any).isKeyBackupEnabled()
+          setKeyBackupEnabled(!!kb)
+        }
+      } catch {}
     })
   }
 
+  /* ---------- start client w/ stores + fallback ready nudge ---------- */
   async function start(c: MatrixClient) {
     const token = (c as any).getAccessToken?.() ?? (c as any).accessToken
-    if (!nonEmpty(token)) { console.warn('[Matrix] start() aborted: no access token'); return }
+    if (!nonEmpty(token)) {
+      console.warn('[Matrix] start() aborted: no access token')
+      return
+    }
     if (startedRef.current) return
     startedRef.current = true
 
-    // persistent stores (must exist BEFORE crypto init)
+    // Persistent stores (best effort)
     try {
       const { IndexedDBStore } = await import('matrix-js-sdk/lib/store/indexeddb')
       const { IndexedDBCryptoStore } = await import('matrix-js-sdk/lib/crypto/store/indexeddb-crypto-store')
@@ -209,41 +223,33 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
       console.warn('[Matrix] IndexedDB stores unavailable; using memory stores.', e)
     }
 
-    // Init crypto (but DON'T start client here)
+    // Try to enable crypto immediately (ok if it fails — events will init)
     const enabled = await ensureCrypto(c)
-    setCryptoEnabled(enabled || typeof (window as any).Olm !== 'undefined')
+    setCryptoEnabled(enabled)
 
     bindClient(c)
 
-    // Now start the client
     await c.startClient({
       initialSyncLimit: 50,
       lazyLoadMembers: true,
       timelineSupport: true,
     })
 
-    // Verify crypto becomes visible to the SDK after sync begins (legacy OLM quirk)
-    const checkCryptoReady = async (tries = 0): Promise<void> => {
-      if (hasCrypto(c)) {
-        console.log('[Vanish] Crypto fully active ✓')
-        setCryptoEnabled(true)
-        return
-      }
-      if (tries > 10) { // ~5s max
-        console.warn('[Vanish] Crypto check timeout — legacy OLM might be slow to report readiness')
-        return
-      }
-      await new Promise(res => setTimeout(res, 500))
-      await checkCryptoReady(tries + 1)
-    }
-    checkCryptoReady()
+    // Fallback nudge: if rooms exist but PREPARED didn't fire, flip ready anyway
+    setTimeout(() => {
+      try {
+        const anyRooms = roomsArray(c).length > 0
+        if (anyRooms) {
+          setReady(true)
+          setRooms(sortRooms(roomsArray(c)) as Room[])
+        }
+      } catch {}
+    }, 3000)
   }
 
-  // ---------- login flows ----------
+  /* ---------- login flows ---------- */
   async function initPasswordLogin({ homeserver, user, pass }: {
-    homeserver: string
-    user: string
-    pass: string
+    homeserver: string; user: string; pass: string
   }) {
     const hs = normHs(homeserver)
     const temp = createClient({ baseUrl: hs })
@@ -267,44 +273,36 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     setHomeserver(hs)
     setClient(c)
 
+    // Kick crypto quickly after login
+    ensureCrypto(c)
+      .then(ok => { setCryptoEnabled(ok) })
+      .catch(e => console.warn('[Vanish] post-login ensureCrypto failed', e))
+
     await start(c)
   }
 
-  async function finishSsoLoginWithToken({ homeserver, token }:{
-    homeserver:string; token:string
-  }) {
+  async function finishSsoLoginWithToken({ homeserver, token }: { homeserver: string; token: string }) {
     const hs = normHs(homeserver)
     const temp = createClient({ baseUrl: hs })
-    const raw  = await temp.loginWithToken(token) as RawLoginResult
-    const res  = normalizeLoginResult(raw)
-
+    const raw = await (temp as any).loginWithToken(token) as RawLoginResult
+    const res = normalizeLoginResult(raw)
     localStorage.setItem(HS_STORAGE_KEY, hs)
     localStorage.setItem(SESSION_KEY, JSON.stringify({
-      userId: res.userId,
-      accessToken: res.accessToken,
-      deviceId: res.deviceId
+      userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId
     }))
-
     const c = createClient({ baseUrl: hs, userId: res.userId, accessToken: res.accessToken, deviceId: res.deviceId })
-    setHomeserver(hs)
-    setClient(c)
-
-    await start(c)
+    setHomeserver(hs); setClient(c); await start(c)
   }
 
-  async function startWithAccessToken({ homeserver, userId, accessToken, deviceId }:{
-    homeserver:string; userId:string; accessToken:string; deviceId?:string
+  async function startWithAccessToken({ homeserver, userId, accessToken, deviceId }: {
+    homeserver: string; userId: string; accessToken: string; deviceId?: string
   }) {
     if (!nonEmpty(userId) || !nonEmpty(accessToken)) return
     const hs = normHs(homeserver)
-    const c  = createClient({ baseUrl: hs, userId, accessToken, deviceId })
+    const c = createClient({ baseUrl: hs, userId, accessToken, deviceId })
     localStorage.setItem(HS_STORAGE_KEY, hs)
     localStorage.setItem(SESSION_KEY, JSON.stringify({ userId, accessToken, deviceId }))
-
-    setHomeserver(hs)
-    setClient(c)
-
-    await start(c)
+    setHomeserver(hs); setClient(c); await start(c)
   }
 
   async function logout() {
@@ -314,25 +312,25 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     window.location.reload()
   }
 
-  // ---------- internal helpers ----------
+  /* ---------- internal helpers ---------- */
   async function maybeInitCrypto() {
     if (!client) throw new Error('No client')
     if (!hasCrypto(client)) {
       const ok = await ensureCrypto(client)
-      setCryptoEnabled(ok || typeof (window as any).Olm !== 'undefined')
+      setCryptoEnabled(ok)
     }
     if (!hasCrypto(client)) throw new Error('Crypto not initialised')
     return (client as any).getCrypto?.() || (client as any).crypto || client
   }
 
-  // ---------- history ----------
+  /* ---------- history ---------- */
   async function paginateBack(roomId: string, batches = 10, limitPerBatch = 50): Promise<number> {
     if (!client) return 0
     const room = client.getRoom(roomId)
     if (!room) return 0
     const tl = room.getLiveTimeline()
     let loaded = 0
-    for (let i=0;i<batches;i++) {
+    for (let i = 0; i < batches; i++) {
       const more = await client.paginateEventTimeline(tl, { backwards: true, limit: limitPerBatch })
       if (!more) break
       loaded += limitPerBatch
@@ -340,20 +338,20 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     return loaded
   }
 
-  // ---------- import/export ----------
+  /* ---------- import/export keys ---------- */
   async function importRoomKeysFromFile(file: File) {
     if (!client) return
-    const crypto = await maybeInitCrypto().catch((e)=>{ alert('Import failed: ' + (e?.message ?? String(e))); return null })
+    const crypto = await maybeInitCrypto().catch(e => { alert('Import failed: ' + (e?.message ?? String(e))); return null })
     if (!crypto && !(client as any).importRoomKeys) return
 
     const text = await file.text()
 
+    // Armored export from Element Desktop (not supported by matrix-js-sdk)
     if (/^-{5}BEGIN MEGOLM SESSION DATA-{5}/m.test(text)) {
       alert(
-        "This file is the armoured 'BEGIN MEGOLM SESSION DATA' format.\n\n" +
-        "matrix-js-sdk cannot import it directly.\n\n" +
-        "Use Element’s “Export E2E room keys” (JSON) and import that here, " +
-        "or verify this session from Element to share keys automatically."
+        "This file appears to be the armoured 'BEGIN MEGOLM SESSION DATA' format from Element Desktop.\n\n" +
+        "matrix-js-sdk cannot import it directly. Please export keys as JSON in Element, " +
+        "or verify this session from Element so keys are shared automatically."
       )
       return
     }
@@ -382,7 +380,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   async function exportRoomKeysToFile(filename = 'vanish-room-keys.json') {
     if (!client) return
-    const crypto = await maybeInitCrypto().catch((e)=>{ alert('Export failed: ' + (e?.message ?? String(e))); return null })
+    const crypto = await maybeInitCrypto().catch(e => { alert('Export failed: ' + (e?.message ?? String(e))); return null })
     if (!crypto && !(client as any).exportRoomKeys) return
 
     try {
@@ -391,44 +389,50 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         ? await (crypto as any).exportRoomKeys({ passphrase })
         : await (client as any).exportRoomKeys({ passphrase })
       const blob = new Blob([data], { type: 'application/json' })
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click(); URL.revokeObjectURL(a.href)
-    } catch (e:any) { alert('Export failed: ' + (e?.message ?? String(e))) }
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(a.href)
+    } catch (e: any) {
+      alert('Export failed: ' + (e?.message ?? String(e)))
+    }
   }
 
-  // ---------- E2EE going forward ----------
+  /* ---------- encryption helpers ---------- */
   async function ensureRoomEncrypted(roomId: string) {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
 
     const room = client.getRoom(roomId)
     if (!room) throw new Error('Unknown room')
+    if (room.isEncrypted?.()) return
 
-    if (room.isEncrypted && room.isEncrypted()) return
-
+    const content = { algorithm: 'm.megolm.v1.aes-sha2' }
     if ((client as any).setRoomEncryption) {
-      await (client as any).setRoomEncryption(roomId, { algorithm: 'm.megolm.v1.aes-sha2' })
+      await (client as any).setRoomEncryption(roomId, content)
     } else {
-      await client.sendStateEvent(roomId, 'm.room.encryption', { algorithm: 'm.megolm.v1.aes-sha2' }, '')
+      await client.sendStateEvent(roomId, 'm.room.encryption', content, '')
     }
   }
 
   async function createEncryptedRoom(name?: string): Promise<string> {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
-    const res = await client.createRoom({
+    const res: any = await client.createRoom({
       name,
       preset: 'private_chat',
       initial_state: [
         { type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } },
       ],
     })
-    return (res as any).room_id as string
+    return res.room_id as string
   }
 
   async function createEncryptedDM(userId: string): Promise<string> {
     if (!client) throw new Error('No client')
     await maybeInitCrypto()
-    const res = await client.createRoom({
+    const res: any = await client.createRoom({
       preset: 'trusted_private_chat',
       is_direct: true,
       invite: [userId],
@@ -436,18 +440,26 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
         { type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } },
       ],
     })
-    return (res as any).room_id as string
+    return res.room_id as string
   }
 
-  // ---------- auto-restore session ----------
+  /* ---------- auto-restore session ---------- */
   useEffect(() => {
-    const hs  = normHs(localStorage.getItem(HS_STORAGE_KEY) || '')
+    const hs = (localStorage.getItem(HS_STORAGE_KEY) || '').trim()
     const raw = localStorage.getItem(SESSION_KEY)
     if (!hs || !raw) return
     try {
       const s = JSON.parse(raw)
-      if (!nonEmpty(s.userId) || !nonEmpty(s.accessToken)) { localStorage.removeItem(SESSION_KEY); return }
-      const c = createClient({ baseUrl: hs, userId: s.userId, accessToken: s.accessToken, deviceId: s.deviceId })
+      if (!nonEmpty(s.userId) || !nonEmpty(s.accessToken)) {
+        localStorage.removeItem(SESSION_KEY)
+        return
+      }
+      const c = createClient({
+        baseUrl: hs,
+        userId: s.userId,
+        accessToken: s.accessToken,
+        deviceId: s.deviceId,
+      })
       setHomeserver(hs)
       setClient(c)
       start(c)
@@ -457,6 +469,7 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  /* ---------- ctx value ---------- */
   const value = useMemo<MatrixCtx>(() => ({
     client, ready, syncing, rooms, homeserver,
     initPasswordLogin, finishSsoLoginWithToken, startWithAccessToken, logout,
@@ -467,6 +480,8 @@ export function MatrixProvider({ children }: { children: React.ReactNode }) {
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }
+
+/* -------------- hook -------------- */
 
 export function useMatrix(): MatrixCtx {
   const v = useContext(Ctx)
