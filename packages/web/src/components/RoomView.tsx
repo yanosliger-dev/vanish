@@ -13,13 +13,13 @@ export default function RoomView({ activeRoomId }: Props) {
     logout,
   } = useMatrix()
 
-  // Select room from rooms list
+  // Pick from reactive list
   const room: Room | undefined = useMemo(
     () => rooms.find(r => r.roomId === activeRoomId),
     [rooms, activeRoomId]
   )
 
-  // Bind to SDK room (handles delay before rooms[] populates)
+  // Bind to SDK room (handles tiny delay before rooms[] is populated)
   const [boundRoom, setBoundRoom] = useState<Room | undefined>(room)
 
   useEffect(() => {
@@ -47,6 +47,20 @@ export default function RoomView({ activeRoomId }: Props) {
 
   const isEncrypted = boundRoom?.isEncrypted && boundRoom.isEncrypted()
 
+  // -------------------------- Helpers --------------------------
+  /** Wait until the SDK really knows this room */
+  async function waitForRoomReady(roomId: string, timeoutMs = 8000) {
+    if (!client) return
+    const step = 200
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      const r = client.getRoom(roomId)
+      // crude but effective: ensure there is a live timeline and we have membership info
+      if (r && r.getLiveTimeline() && r.getMyMembership?.() === 'join') return
+      await new Promise(res => setTimeout(res, step))
+    }
+  }
+
   // -------------------------- Bind events --------------------------
   useEffect(() => {
     if (!client || !boundRoom) return
@@ -56,11 +70,7 @@ export default function RoomView({ activeRoomId }: Props) {
     const onTimeline = (_ev: MatrixEvent, r: Room) => {
       if (r.roomId === boundRoom.roomId) refresh()
     }
-
-    // 🔄 New: also refresh when room state changes (e.g., encryption enabled)
-    const onRoomState = () => {
-      refresh()
-    }
+    const onRoomState = () => { refresh() }
 
     client.on('Room.timeline', onTimeline)
     client.on('Room.name', refresh)
@@ -104,18 +114,37 @@ export default function RoomView({ activeRoomId }: Props) {
     }
 
     if (type === 'm.room.member') return `${c?.membership ?? 'updated membership'}`
-    if (type === 'm.room.topic') return `* set the topic to: ${c?.topic ?? ''}`
+    if (type === 'm.room.topic')  return `* set the topic to: ${c?.topic ?? ''}`
     return null
   }
 
   // -------------------------- Encrypt room --------------------------
   async function encryptRoomNow() {
-    if (!boundRoom) return
+    if (!boundRoom || !client) return
     setEncrypting(true)
+    const roomId = boundRoom.roomId
+
     try {
-      await ensureRoomEncrypted(boundRoom.roomId)
-      // force-refresh banner instantly
-      setTimeout(() => setEvents(boundRoom.getLiveTimeline().getEvents()), 200)
+      await waitForRoomReady(roomId) // <- ensure SDK knows the room
+      try {
+        await ensureRoomEncrypted(roomId)
+      } catch (e: any) {
+        // Some homeservers/SDK timing can throw "Unknown room" right after navigation/creation.
+        if (String(e?.message || e).toLowerCase().includes('unknown room')) {
+          await new Promise(res => setTimeout(res, 400))
+          await waitForRoomReady(roomId, 4000)
+          await ensureRoomEncrypted(roomId) // retry once
+        } else {
+          throw e
+        }
+      }
+
+      // Nudge UI to flip banner ASAP
+      setTimeout(() => {
+        const r = client.getRoom(roomId)
+        if (r) setEvents(r.getLiveTimeline().getEvents())
+      }, 200)
+
       alert('Room encryption enabled. New messages will be end-to-end encrypted.')
     } catch (e: any) {
       alert('Failed to enable encryption: ' + (e?.message ?? String(e)))
@@ -127,6 +156,10 @@ export default function RoomView({ activeRoomId }: Props) {
   // -------------------------- Send message --------------------------
   async function sendMessage() {
     if (!client || !boundRoom) return
+    const roomId = boundRoom.roomId
+
+    await waitForRoomReady(roomId)
+
     if (!boundRoom.isEncrypted?.() && !confirm('This room is not encrypted. Encrypt it now?')) {
       return
     }
@@ -139,7 +172,7 @@ export default function RoomView({ activeRoomId }: Props) {
     if (!body) return
     setSending(true)
     try {
-      await client.sendEvent(boundRoom.roomId, 'm.room.message', { msgtype: 'm.text', body })
+      await client.sendEvent(roomId, 'm.room.message', { msgtype:'m.text', body })
       if (inputRef.current) inputRef.current.value = ''
     } finally { setSending(false) }
   }
@@ -151,7 +184,7 @@ export default function RoomView({ activeRoomId }: Props) {
   // -------------------------- Render states --------------------------
   if (!ready) return <div className="main"><div className="footer-note">Syncing…</div></div>
   if (!activeRoomId) return <div className="main"><div className="footer-note">Select a room</div></div>
-  if (!boundRoom) return <div className="main"><div className="footer-note">Preparing room…</div></div>
+  if (!boundRoom)  return <div className="main"><div className="footer-note">Preparing room…</div></div>
 
   // -------------------------- UI --------------------------
   return (
@@ -162,7 +195,7 @@ export default function RoomView({ activeRoomId }: Props) {
           {loadingOlder ? 'Loading…' : 'Load older'}
         </button>
 
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div style={{ marginLeft:'auto', display:'flex', gap:8, alignItems:'center' }}>
           <span className="footer-note">
             {isEncrypted ? '🔐 Encrypted' : '⚠️ Not encrypted'}
             {' '}· Crypto {cryptoEnabled ? 'on' : 'off'}
@@ -174,32 +207,19 @@ export default function RoomView({ activeRoomId }: Props) {
             </button>
           )}
 
-          <label style={{ cursor: 'pointer' }}>
+          <label style={{ cursor:'pointer' }}>
             <span className="btn ghost">Import keys…</span>
-            <input
-              type="file"
-              accept="application/json,.json,.txt"
-              style={{ display: 'none' }}
-              onChange={e => {
-                const f = e.target.files?.[0]
-                if (f) importRoomKeysFromFile(f)
-              }}
-            />
+            <input type="file" accept="application/json,.json,.txt" style={{ display:'none' }}
+                   onChange={e => { const f = e.target.files?.[0]; if (f) importRoomKeysFromFile(f) }} />
           </label>
 
-          <button className="btn ghost" onClick={() => exportRoomKeysToFile()}>Export keys</button>
+          <button className="btn ghost" onClick={()=>exportRoomKeysToFile()}>Export keys</button>
           <button className="btn" onClick={logout}>Log out</button>
         </div>
       </div>
 
       {!isEncrypted && (
-        <div style={{
-          margin: '8px 0',
-          padding: 10,
-          borderRadius: 12,
-          background: 'rgba(255,200,0,0.08)',
-          border: '1px solid rgba(255,200,0,0.25)'
-        }}>
+        <div style={{ margin:'8px 0', padding:10, borderRadius:12, background:'rgba(255,200,0,0.08)', border:'1px solid rgba(255,200,0,0.25)' }}>
           This room is not encrypted. Click <b>Encrypt this room</b> to enable end-to-end encryption (Megolm) for all new messages.
         </div>
       )}
@@ -220,15 +240,10 @@ export default function RoomView({ activeRoomId }: Props) {
       </div>
 
       <div className="composer">
-        <textarea
-          ref={inputRef}
-          className="textarea"
-          placeholder="Write a message… (Enter to send, Shift+Enter for newline)"
-          onKeyDown={onKeyDown}
-        />
-        <button className="btn" onClick={sendMessage} disabled={sending}>
-          {sending ? 'Sending…' : 'Send'}
-        </button>
+        <textarea ref={inputRef} className="textarea"
+                  placeholder="Write a message… (Enter to send, Shift+Enter for newline)"
+                  onKeyDown={onKeyDown}/>
+        <button className="btn" onClick={sendMessage} disabled={sending}>{sending ? 'Sending…' : 'Send'}</button>
       </div>
     </div>
   )
