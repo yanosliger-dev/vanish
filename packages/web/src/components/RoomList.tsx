@@ -1,11 +1,12 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useMatrix } from '../matrix/client'
 import type { Room } from 'matrix-js-sdk'
 
 /** Parse active room id from hash like #/room/<roomId> (fallback: empty) */
 function getActiveFromHash(): string {
-  const m = window.location.hash.match(/#\/room\/(.+)/)
-  return m?.[1] ?? ''
+  // capture after /room/ up to a ? or # or end; decode to support special chars
+  const m = window.location.hash.match(/#\/room\/([^?#]+)/)
+  return m?.[1] ? decodeURIComponent(m[1]) : ''
 }
 
 export default function RoomList() {
@@ -18,6 +19,7 @@ export default function RoomList() {
 
   const [query, setQuery] = useState('')
   const [active, setActive] = useState<string>(getActiveFromHash())
+  const activeRef = useRef<HTMLDivElement | null>(null)
 
   // keep selection in sync with URL hash (works with RoomView implementations that read the hash)
   useEffect(() => {
@@ -26,11 +28,14 @@ export default function RoomList() {
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
 
-  // First room as default if none selected
+  // If hash points to a room we don't have (yet) and we do have rooms, select the first one.
   useEffect(() => {
-    if (!active && rooms.length) {
-      setActive(rooms[0].roomId)
-      window.location.hash = `#/room/${rooms[0].roomId}`
+    if (!rooms.length) return
+    const found = active && rooms.some(r => r.roomId === active)
+    if (!active || !found) {
+      const first = rooms[0].roomId
+      setActive(first)
+      window.location.hash = `#/room/${encodeURIComponent(first)}`
     }
   }, [active, rooms])
 
@@ -46,7 +51,7 @@ export default function RoomList() {
   function selectRoom(roomId: string) {
     setActive(roomId)
     // hash helps RoomView implementations that rely on location
-    window.location.hash = `#/room/${roomId}`
+    window.location.hash = `#/room/${encodeURIComponent(roomId)}`
   }
 
   async function onNewDM() {
@@ -74,6 +79,13 @@ export default function RoomList() {
     }
   }
 
+  // smooth UX: keep the selected item visible after list/filter changes
+  useEffect(() => {
+    if (activeRef.current) {
+      activeRef.current.scrollIntoView({ block: 'nearest' })
+    }
+  }, [active, filtered.length])
+
   return (
     <div className="sidebar-inner" style={{ display:'flex', flexDirection:'column', height:'100%' }}>
       <div style={{ display:'flex', gap:8, margin:'8px 8px 6px 8px' }}>
@@ -95,6 +107,7 @@ export default function RoomList() {
           return (
             <div
               key={r.roomId}
+              ref={isActive ? activeRef : null}
               className="room-list-item"
               onClick={() => selectRoom(r.roomId)}
               style={{
